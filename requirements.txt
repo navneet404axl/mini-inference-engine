@@ -1,0 +1,14 @@
+# --- Web server ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+
+# --- Model / inference ---
+# torch is assumed preinstalled with the correct CUDA build for this machine
+# (this studio has 2.8.0+cu128). Listing it keeps the env reproducible; pip
+# will leave an existing satisfying install alone rather than downgrade it.
+# If installing fresh on a GPU box, install the matching CUDA wheel first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch>=2.4
+transformers>=4.45        # Qwen2.5 architecture support landed in 4.45
+accelerate>=0.34          # device placement helpers
