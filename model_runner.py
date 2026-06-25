@@ -147,6 +147,103 @@ class ModelRunner:
 
         # STEP 3: return the list of generated token ids (your logic here)
         """
+        with torch.no_grad():
+            outputs = self.model(input_ids, use_cache=True)
+            past_key_values =  outputs.past_key_values
+            generated = []                          # collect new token ids here
+
+            for i in range(max_tokens):
+                next_token_logits = outputs.logits[:,-1,:]
+
+                if temperature == 0:
+                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                else:
+                    scaled = next_token_logits / temperature
+                    probs = torch.softmax(scaled, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+
+                token_id = next_token.item()         # tensor -> plain int
+                generated.append(token_id)
+
+                if token_id == self.eos_token_id:    # stop early
+                    break
+                outputs = self.model(next_token, past_key_values=past_key_values, use_cache=True)
+                past_key_values = outputs.past_key_values 
+        return generated
+
         raise NotImplementedError(
             "generate_tokens is yours to implement — see the STEP comments above."
         )
+
+    # ------------------------------------------------------------------ #
+    # STUB — YOU IMPLEMENT THIS (CLAUDE.md: the decode/token gen loop).   #
+    # Streaming twin of generate_tokens: same loop, but YIELDS decoded    #
+    # text per token instead of collecting ids into a list.              #
+    # ------------------------------------------------------------------ #
+    def stream_tokens(
+        self,
+        input_ids: torch.Tensor,
+        max_tokens: int,
+        temperature: float,
+    ):
+        """
+        Autoregressive decode loop as a GENERATOR — yields text incrementally.
+
+        Mirrors generate_tokens(), with two differences:
+          1. Instead of appending token ids to a list and returning at the end,
+             you YIELD the decoded text for each new token as it is produced.
+          2. You stop BEFORE yielding the EOS token, so the caller never sees
+             the end-of-sequence marker as output.
+
+        Input:
+          - input_ids:   LongTensor of shape (1, prompt_len) already on self.device
+          - max_tokens:  max number of NEW tokens to generate
+          - temperature: sampling temperature (0 or near-0 -> effectively greedy)
+        Yields:
+          - str: the decoded text for each new token, one at a time
+                 (self.tokenizer.decode([token_id]))
+
+        # STEP 1: prime the KV cache (your logic here)
+        #   - run ONE forward pass on the full prompt with use_cache=True
+        #   - keep outputs (for logits) and outputs.past_key_values (the cache)
+
+        # STEP 2: loop up to max_tokens times (your logic here)
+        #   - take logits[:, -1, :], apply temperature + softmax + sample,
+        #     or argmax when temperature ~ 0  (same sampling as generate_tokens)
+        #   - convert the sampled tensor to a plain int token_id
+        #   - CHECK EOS FIRST: if token_id == self.eos_token_id, break and do
+        #     NOT yield it (this is the key difference — check BEFORE yielding)
+        #   - otherwise: yield self.tokenizer.decode([token_id])
+        #   - feed ONLY the new token back in with past_key_values + use_cache=True,
+        #     then refresh past_key_values from the new outputs
+
+        # STEP 3: nothing to return — a generator just stops when the loop ends
+        """
+        with torch.no_grad():
+            outputs = self.model(input_ids, use_cache=True)
+            past_key_values =  outputs.past_key_values
+            for i in range(max_tokens):
+                next_token_logits = outputs.logits[:,-1,:]
+
+                if temperature == 0:
+                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                else:
+                    scaled = next_token_logits / temperature
+                    probs = torch.softmax(scaled, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+
+                token_id = next_token.item()         # tensor -> plain int
+
+
+                if token_id == self.eos_token_id:    # stop early
+                    break
+                yield self.tokenizer.decode([token_id])
+                outputs = self.model(next_token, past_key_values=past_key_values, use_cache=True)
+                past_key_values = outputs.past_key_values 
+                    
+        # raise NotImplementedError(
+        #     "stream_tokens is yours to implement — see the STEP comments above."
+        # )
+        # yield  # unreachable: makes this a generator function NOW, so the
+        #        /generate/stream endpoint can iterate it. Delete this line
+        #        (and the raise above) once your loop's own `yield` is in place.
