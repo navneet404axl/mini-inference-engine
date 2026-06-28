@@ -1,20 +1,36 @@
 """
 main.py — FastAPI server for the mini inference engine.
 
-v1 scope (per README): single model, single GPU, POST /generate.
-The request queue, batching, and the /metrics aggregation (p50/p95/p99) are
-deliberately NOT here yet — those are yours to build (CLAUDE.md). This file is
-just the HTTP scaffolding wired to the ModelRunner.
+v2 scope: every /generate request is serialized through ONE background worker
+that owns the GPU. The flow is now producer/consumer:
+
+    /generate handler (producer)
+        --> builds a GenRequest (prompt + params + its own Future)
+        --> puts it on REQUEST_QUEUE
+        --> awaits the Future
+                                  REQUEST_QUEUE (bounded asyncio.Queue)
+    worker() (single consumer)
+        --> gets the next GenRequest
+        --> runs the model
+        --> resolves that request's Future with the result
+
+This is the foundation for dynamic batching next week: once all work funnels
+through the one worker, the worker can start pulling N requests at once instead
+of one. The request-queue/backpressure logic, the worker body, and the producer
+body are YOURS (CLAUDE.md / Core List) — left as stubs below. The asyncio wiring
+(queue object, startup/shutdown, create_task) is plumbing and is fully written.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -37,18 +53,149 @@ class GenerateResponse(BaseModel):
     latency_ms: float
 
 
-# --------------------------- app lifecycle --------------------------- #
+# --------------------------- the queue (plumbing) --------------------------- #
+# Single hand-off point between the async HTTP handlers (producers) and the one
+# background worker (consumer) that owns the GPU.
+#
+# Why BOUNDED, and why SMALL: maxsize caps how many requests can sit waiting in
+# memory at once. When the queue is full, `await REQUEST_QUEUE.put(...)` blocks
+# the producer until the worker drains one — i.e. the queue itself becomes the
+# backpressure valve instead of letting an unbounded backlog grow until the box
+# OOMs. 32 is a deliberately small placeholder: big enough to keep the worker fed,
+# small enough that overload is felt quickly. Tune it once you have metrics.
+#
+# (Constructing the Queue at import time is fine on Python 3.10+: it binds to the
+# running loop lazily on first use, not here.)
+REQUEST_QUEUE: "asyncio.Queue[GenRequest]" = asyncio.Queue(maxsize=32)
+
+
+# --------------------------- Core List: request container (STUB) --------------------------- #
+@dataclass
+class GenRequest:
+    """
+    One in-flight generation request as it travels through the queue.
+
+    The producer (/generate) builds one of these, drops it on REQUEST_QUEUE, then
+    awaits `.future`. The worker pulls it off, runs the model, and fulfils
+    `.future` with the result — that round trip is the whole point of the queue.
+
+    Fields (this is the container's "signature" — no behaviour to implement here):
+      - prompt / max_tokens / temperature: the generation inputs.
+      - future: the asyncio.Future the worker resolves with the GenerateResponse.
+    """
+
+    prompt: str
+    max_tokens: int
+    temperature: float
+    # asyncio.Future = a one-shot "the result will arrive later" box. The producer
+    # CREATES it and awaits it; the worker fills it via .set_result(...) (or
+    # .set_exception(...) on failure), which is what wakes the awaiting producer.
+    # It must be created on the running loop, so the producer makes it (see
+    # /generate STEP 1) and passes it in here.
+    future: "asyncio.Future[GenerateResponse]"
+
+
+# --------------------------- Core List: the worker (STUB) --------------------------- #
+async def worker(runner: ModelRunner) -> None:
+    """
+    The single background consumer. Owns the GPU: it is the ONLY thing that calls
+    the model, so all requests are serialized through here. Runs forever until the
+    shutdown hook cancels it.
+
+    Input:
+      - runner: the shared ModelRunner (loaded once at startup).
+    Returns:
+      - never returns normally; exits only via cancellation at an await point.
+
+    # STEP 1: loop forever  ->  `while True:`
+
+    # STEP 2: get the next request off the queue (your logic here)
+    #   - req = await REQUEST_QUEUE.get()
+    #   - the `await` parks this coroutine until a request is available — no
+    #     busy-waiting, the event loop runs other things meanwhile.
+
+    # STEP 3: run the model on this request (your logic here)
+    #   - call runner.generate_text(prompt=..., max_tokens=..., temperature=...)
+    #   - time it (time.perf_counter()) to fill latency_ms, like the old handler did
+    #   - NOTE: generate_text() is BLOCKING GPU work. Awaiting nothing inside it
+    #     means it blocks the event loop for its whole duration. That's acceptable
+    #     for now (one worker, fully serialized) but worth knowing — later you may
+    #     push it onto a thread via loop.run_in_executor(...) so the loop can keep
+    #     accepting requests. Your design call.
+
+    # STEP 4: resolve THIS request's Future with the result (your logic here)
+    #   - req.future.set_result(GenerateResponse(...))  <-- this wakes the producer
+    #     that's awaiting req.future over in /generate.
+    #   - wrap STEP 3 in try/except and on error call req.future.set_exception(err)
+    #     instead — otherwise one bad request hangs that client's await forever AND
+    #     an unhandled exception here would kill the worker for everyone.
+
+    # STEP 5: mark the queue item done (your logic here)
+    #   - REQUEST_QUEUE.task_done()  (pairs with the get() in STEP 2)
+    """
+    # loop = asyncio.new_event_loop()
+    # asyncio.set_event_loop()
+    # loop.run_forever()
+    # REQUEST_QUEUE.get()
+    while True:
+        req = await REQUEST_QUEUE.get()
+        start = time.perf_counter()
+        try:
+            text,tokens_generated = runner.generate_text(
+                prompt=req.prompt,
+                max_tokens=req.max_tokens,
+                temperature=req.temperature,
+                )
+            latency_ms = (time.perf_counter() - start) * 1000.0
+            response = GenerateResponse(
+                text=text,
+                tokens_generated=tokens_generated,
+                latency_ms=latency_ms,
+                )
+            req.future.set_result(response)
+        except Exception as e:
+            req.future.set_exception(e)
+
+        finally:
+            REQUEST_QUEUE.task_done()
+    raise NotImplementedError(
+        "worker is yours to implement — see the STEP comments above."
+    )
+
+
+# --------------------------- app lifecycle (plumbing) --------------------------- #
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load the model once at startup and hang it off app.state for every handler.
+    # --- startup ---
     logger.info("Starting up — loading model ...")
-    app.state.runner = ModelRunner()
-    yield
-    # Nothing to tear down explicitly; let the process drop the GPU memory on exit.
-    logger.info("Shutting down.")
+    app.state.runner = ModelRunner()  # load weights once; reused for every request
+
+    # Launch the single background worker. create_task() SCHEDULES the worker()
+    # coroutine to run concurrently on the event loop and returns IMMEDIATELY with a
+    # Task handle — it does not block or run the worker inline here. We stash the
+    # handle on app.state so the shutdown hook below can cancel it.
+    app.state.worker_task = asyncio.create_task(worker(app.state.runner))
+    logger.info("Background worker started.")
+
+    yield  # <-- app serves requests for its whole lifetime here
+
+    # --- shutdown ---
+    logger.info("Shutting down — stopping worker ...")
+    # cancel() requests cancellation: it arranges for a CancelledError to be raised
+    # inside the worker at its next await point (typically `await REQUEST_QUEUE.get()`).
+    app.state.worker_task.cancel()
+    try:
+        # Await the cancelled task so we actually wait for it to unwind before the
+        # process exits. The CancelledError we just triggered propagates out of this
+        # await — catching and ignoring it is the normal, clean way a cancelled task
+        # is reaped (it is NOT an error here, it's the expected exit signal).
+        await app.state.worker_task
+    except asyncio.CancelledError:
+        pass
+    logger.info("Worker stopped.")
 
 
-app = FastAPI(title="Mini LLM Inference Engine", version="1.0", lifespan=lifespan)
+app = FastAPI(title="Mini LLM Inference Engine", version="2.0", lifespan=lifespan)
 
 
 # --------------------------- routes --------------------------- #
@@ -62,31 +209,57 @@ def health(request: Request) -> dict:
     }
 
 
+# --------------------------- Core List: producer handler (STUB) --------------------------- #
 @app.post("/generate", response_model=GenerateResponse)
-def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
-    """Generate text for a single prompt.
-
-    Defined as a sync `def` on purpose: FastAPI runs sync handlers in a
-    threadpool, so a blocking generation call won't freeze the event loop. When
-    you add the request queue / batcher, this is where you'll route through it
-    instead of calling the runner directly.
+async def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
     """
-    runner: ModelRunner = request.app.state.runner
+    Producer side of the queue. Now `async def` (not the old sync def): it runs ON
+    the event loop so it can await the queue and the Future. It does NOT touch the
+    model directly anymore — it hands work to the worker and waits for the answer.
 
-    # Single-request timing only — this is the response contract's latency_ms,
-    # not the aggregate p50/p95/p99 math (that's yours to build for /metrics).
-    start = time.perf_counter()
-    text, tokens_generated = runner.generate_text(
-        prompt=req.prompt,
-        max_tokens=req.max_tokens,
-        temperature=req.temperature,
+    Input:
+      - req: the validated GenerateRequest (prompt, max_tokens, temperature).
+    Output:
+      - the GenerateResponse the worker produced for this request.
+
+    # STEP 1: create a fresh Future for THIS request (your logic here)
+    #   - future = asyncio.get_running_loop().create_future()
+    #   - a Future is the empty "result will arrive later" box; awaiting it parks
+    #     THIS handler until the worker calls set_result/set_exception on it. Fresh
+    #     one per request so results never cross wires between clients.
+
+    # STEP 2: build the request object (your logic here)
+    #   - wrap the prompt + params + that future in a GenRequest.
+
+    # STEP 3: hand it to the worker by putting it on the queue (your logic here)
+    #   - await REQUEST_QUEUE.put(gen_req)
+    #   - this BLOCKS if the queue is full (the backpressure from maxsize). If you'd
+    #     rather reject instead of wait, use REQUEST_QUEUE.put_nowait(...) inside
+    #     try/except asyncio.QueueFull and raise HTTPException(503). Your call —
+    #     this is the backpressure policy that's yours to design.
+
+    # STEP 4: await the result and return it (your logic here)
+    #   - result = await gen_req.future   <-- suspends here until the worker's
+    #     STEP 4 resolves this exact Future; then control resumes with the value.
+    #   - return result
+    #   - (if you used set_exception in the worker, the await re-raises it here.)
+    """
+    future = asyncio.get_running_loop().create_future()
+    gen_req = GenRequest(
+        prompt = req.prompt,
+        max_tokens = req.max_tokens,
+        temperature = req.temperature,
+        future = future
     )
-    latency_ms = (time.perf_counter() - start) * 1000.0
+    try:
+        REQUEST_QUEUE.put_nowait(gen_req) #no await needed if you were doing .put() the you would have needed await 
+    except asyncio.QueueFull:
+        raise HTTPException(status_code=503, detail="server overloaded, try again later")
+    returned_future = await gen_req.future
+    return returned_future
 
-    return GenerateResponse(
-        text=text,
-        tokens_generated=tokens_generated,
-        latency_ms=latency_ms,
+    raise NotImplementedError(
+        "generate (producer) is yours to implement — see the STEP comments above."
     )
 
 
@@ -94,8 +267,10 @@ def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
 def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse:
     """Stream generated text token-by-token as Server-Sent Events (SSE).
 
-    Same inputs as /generate, but incremental: instead of one JSON body at the
-    end, the client gets one SSE event per token as it is produced.
+    NOTE: streaming still calls the runner directly and does NOT go through the
+    queue/worker yet — a single Future can't carry an incremental stream, that
+    needs a per-request chunk channel. Left as-is for now; revisit once the
+    blocking /generate path is flowing through the worker.
 
     Wire format (SSE):
       data: {"text": "<chunk>"}\n\n      <- one per token
@@ -108,7 +283,7 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
 
     Sync `def` on purpose: stream_tokens() does blocking GPU work, so Starlette
     iterates the returned sync generator in a threadpool and the event loop stays
-    free. When you add the queue/batcher, route the per-token stream through it.
+    free.
     """
     runner: ModelRunner = request.app.state.runner
 
