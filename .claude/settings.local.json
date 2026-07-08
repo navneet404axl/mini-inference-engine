@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile /teamspace/studios/this_studio/mini-inference-engine/main.py)",
+      "Bash(python -m py_compile scripts/verify_decode.py)",
+      "Bash(python *)"
+    ]
+  }
+}

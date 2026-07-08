@@ -247,3 +247,79 @@ class ModelRunner:
         # yield  # unreachable: makes this a generator function NOW, so the
         #        /generate/stream endpoint can iterate it. Delete this line
         #        (and the raise above) once your loop's own `yield` is in place.
+
+    # ------------------------------------------------------------------ #
+    # STUB — YOU IMPLEMENT THIS (CLAUDE.md: the batching logic).          #
+    # ------------------------------------------------------------------ #
+    def _generate_batch_ids(self, prompts: list[str], max_new_tokens: int) -> list[list[int]]:
+        # STEP 1: Configure tokenizer for batching — padding side + pad token
+        # TODO Jul 5: move tokenizer config to __init__ — mutating shared state per-call is a smell
+        self.tokenizer.padding_side = "left"
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # STEP 2: Tokenize all prompts into one padded batch (input_ids + attention_mask), move to device
+        inputs = self.tokenizer(prompts, padding=True, return_tensors="pt").to(self.device)
+
+        with torch.no_grad():
+            # STEP 3: Single batched forward pass (no grad)
+            outputs = self.model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+            )
+            # STEP 4: Extract next-token logits for each sequence from the correct position
+            scores = outputs.logits[:, -1, :]
+            # STEP 5: Greedy pick — per-sequence first generated token (flat [batch] = home shape)
+            next_token_ids = torch.argmax(scores, dim=-1)  # shape: [batch]
+
+            # STEP 6: init bookkeeping for the decode loop
+            batch_size = inputs["input_ids"].shape[0]
+            generated_tokens = [[] for _ in range(batch_size)]
+            finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+            input_ids = inputs["input_ids"]
+            attention_mask = inputs["attention_mask"]
+
+            # STEP 7: batched decode loop — Recompute version (cache ported later, measured)
+            # Home shape: flat [batch]; exactly ONE unsqueeze(1) at the cat.
+            # DESIGN (locked Jul 7): Option A keep-and-ignore; EOS never collected;
+            # flags = flip/filter/exit; mask grows +1s column per step.
+            for step in range(max_new_tokens):
+                # MOVE 1 — CHECK: compare this step's tokens (flat) against eos_token_id -> is_eos [batch] bool
+                is_eos = next_token_ids == self.eos_token_id    # bool [batch]
+                # MOVE 2 — COLLECT: per sequence i: if not finished AND not EOS -> append token into bin i
+                for i in range(batch_size):
+                    if not finished[i] and not is_eos[i]:
+                        generated_tokens[i].append(next_token_ids[i].item())
+                # MOVE 3 — FLIP: OR is_eos into finished (once True, stays True)
+                finished = finished | is_eos
+                # MOVE 4 — EXIT: if all finished -> break
+                if finished.all().item():
+                    break
+                if step == max_new_tokens - 1:
+                    break
+                # MOVE 5 — GROW: unsqueeze tokens to [batch,1], cat onto input_ids (dim=1);
+                #                cat ones-column onto attention_mask (dtype + device must match)
+                # next_token_ids = next_token_ids.unsqueeze(1) dont do this not good 
+                # input_ids = torch.cat([input_ids, next_token_ids],dim=1)
+                token_col = next_token_ids.unsqueeze(1)          # costume, worn once
+                input_ids = torch.cat([input_ids, token_col], dim=1)
+                ones_col = torch.ones((batch_size, 1), dtype=attention_mask.dtype, device=attention_mask.device)
+                attention_mask = torch.cat([attention_mask, ones_col],dim = 1)
+                # MOVE 6 — FORWARD: full input_ids + full mask (recompute), slice [:, -1, :],
+                #                   argmax dim=-1 (flat) -> next step's tokens
+                outputs = self.model( input_ids=input_ids, attention_mask=attention_mask)
+                scores = outputs.logits[:, -1, :]
+                next_token_ids = torch.argmax(scores, dim=-1)
+
+                
+        
+        # STEP 8: decode each bin to text, skip_special_tokens=True, return list[str]
+        # (outside no_grad — tokenizer work, no gradients involved)
+
+        return generated_tokens
+# CHANGED Jul 9: was decode+return text here; now returns raw bins — split for verify_decode (option c), decode moved to public wrapper
+
+
+    def generate_batch(self, prompts: list[str], max_new_tokens: int) -> list[str]: 
+        bins = self._generate_batch_ids(prompts,max_new_tokens)
+        return [self.tokenizer.decode(tokens, skip_special_tokens=True) for tokens in bins]
+        

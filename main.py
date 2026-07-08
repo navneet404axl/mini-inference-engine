@@ -53,6 +53,12 @@ class GenerateResponse(BaseModel):
     latency_ms: float
 
 
+# class FakeRunner:
+#     def generate_text(self, prompt, max_tokens, temperature):
+#         time.sleep(0.05)  # pretend GPU work (blocking, like the real thing)
+#         return f"fake reply to: {prompt[:20]}", 12
+
+
 # --------------------------- the queue (plumbing) --------------------------- #
 # Single hand-off point between the async HTTP handlers (producers) and the one
 # background worker (consumer) that owns the GPU.
@@ -67,6 +73,11 @@ class GenerateResponse(BaseModel):
 # (Constructing the Queue at import time is fine on Python 3.10+: it binds to the
 # running loop lazily on first use, not here.)
 REQUEST_QUEUE: "asyncio.Queue[GenRequest]" = asyncio.Queue(maxsize=32)
+
+# CHANGED 2026-07-02: was no batching knobs (worker consumed one request at a time);
+# now the two dynamic-batching limits below; reason: worker's GRAB phase needs them.
+MAX_BATCH_SIZE = 8  # max requests per forward pass
+BATCH_WINDOW_S = 0.05  # accumulation deadline in seconds; clock starts at first arrival
 
 
 # --------------------------- Core List: request container (STUB) --------------------------- #
@@ -94,6 +105,14 @@ class GenRequest:
     # /generate STEP 1) and passes it in here.
     future: "asyncio.Future[GenerateResponse]"
 
+    # --- metrics timestamps (all optional, default None; NOBODY sets them here) ---
+    # Each records one monotonic clock reading on this request's journey. They are
+    # left as empty slots; the stamping code is Nony's to write at each stage.
+    t_arrival: float | None = None       # stamped by ENDPOINT (/generate) at birth of GenRequest
+    t_batch_entry: float | None = None   # stamped by WORKER when this request is pulled into a batch
+    t_first_token: float | None = None   # stamped by RUNNER inside the decode loop (Stage 1a2, may defer)
+    t_completion: float | None = None    # stamped by WORKER just before set_result
+
 
 # --------------------------- Core List: the worker (STUB) --------------------------- #
 async def worker(runner: ModelRunner) -> None:
@@ -107,60 +126,92 @@ async def worker(runner: ModelRunner) -> None:
     Returns:
       - never returns normally; exits only via cancellation at an await point.
 
-    # STEP 1: loop forever  ->  `while True:`
+    # CHANGED 2026-07-02: was one-request-at-a-time (get -> run -> resolve) with an
+    # unreachable raise NotImplementedError after the loop; now a two-phase batching
+    # loop (STEP A grab / STEP B run) and the dead raise is deleted; reason: dynamic
+    # batching — amortize each forward pass over up to MAX_BATCH_SIZE requests.
 
-    # STEP 2: get the next request off the queue (your logic here)
-    #   - req = await REQUEST_QUEUE.get()
-    #   - the `await` parks this coroutine until a request is available — no
-    #     busy-waiting, the event loop runs other things meanwhile.
-
-    # STEP 3: run the model on this request (your logic here)
-    #   - call runner.generate_text(prompt=..., max_tokens=..., temperature=...)
-    #   - time it (time.perf_counter()) to fill latency_ms, like the old handler did
-    #   - NOTE: generate_text() is BLOCKING GPU work. Awaiting nothing inside it
-    #     means it blocks the event loop for its whole duration. That's acceptable
-    #     for now (one worker, fully serialized) but worth knowing — later you may
-    #     push it onto a thread via loop.run_in_executor(...) so the loop can keep
-    #     accepting requests. Your design call.
-
-    # STEP 4: resolve THIS request's Future with the result (your logic here)
-    #   - req.future.set_result(GenerateResponse(...))  <-- this wakes the producer
-    #     that's awaiting req.future over in /generate.
-    #   - wrap STEP 3 in try/except and on error call req.future.set_exception(err)
-    #     instead — otherwise one bad request hangs that client's await forever AND
-    #     an unhandled exception here would kill the worker for everyone.
-
-    # STEP 5: mark the queue item done (your logic here)
-    #   - REQUEST_QUEUE.task_done()  (pairs with the get() in STEP 2)
+    Shape of each trip around the loop:
+      STEP A — GRAB PHASE (yours): assemble a batch off REQUEST_QUEUE, bounded by
+        MAX_BATCH_SIZE and a BATCH_WINDOW_S deadline that starts at first arrival.
+      STEP B — RUN PHASE (written): execute the batch and resolve each request's
+        Future. Temporarily sequential per request; later one batched forward pass.
     """
-    # loop = asyncio.new_event_loop()
-    # asyncio.set_event_loop()
-    # loop.run_forever()
-    # REQUEST_QUEUE.get()
     while True:
-        req = await REQUEST_QUEUE.get()
-        start = time.perf_counter()
-        try:
-            text,tokens_generated = runner.generate_text(
-                prompt=req.prompt,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                )
-            latency_ms = (time.perf_counter() - start) * 1000.0
-            response = GenerateResponse(
-                text=text,
-                tokens_generated=tokens_generated,
-                latency_ms=latency_ms,
-                )
-            req.future.set_result(response)
-        except Exception as e:
-            req.future.set_exception(e)
+        # ---------------- STEP A: GRAB PHASE (MY LOGIC — do not implement) ----------------
+        # Assemble `batch: list[GenRequest]`:
+        #   - Block on the empty queue; the FIRST arrival opens the batch and starts
+        #     a FIXED deadline (BATCH_WINDOW_S measured from that first arrival —
+        #     the deadline does NOT reset as more requests come in).
+        #   - Keep grabbing further requests, each wait bounded by the REMAINING
+        #     time until that deadline, until the batch is full (MAX_BATCH_SIZE)
+        #     or the deadline expires.
+        #   - TimeoutError is the go-signal ("window closed, ship what you have"),
+        #     not an error.
+        # Tools for this: asyncio.wait_for(...) + asyncio.TimeoutError for the
+        # bounded waits; time.monotonic() for the fixed deadline / remaining-time math.
+        # Move 1 — blocking first grab
+        first_req = await REQUEST_QUEUE.get()
+        first_req.t_batch_entry = time.monotonic()
+        batch = [first_req]
+        # METRICS STEP 2: stamp t_batch_entry when request enters a batch
+        # (applies to BOTH the first_req above and each `req` appended in Move 4 —
+        # every request that joins `batch` gets its t_batch_entry set. Your logic.)
 
-        finally:
-            REQUEST_QUEUE.task_done()
-    raise NotImplementedError(
-        "worker is yours to implement — see the STEP comments above."
-    )
+        # Move 2 — start fixed clock
+        deadline = time.monotonic() + BATCH_WINDOW_S
+
+        # Move 3 — accumulation loop: keep going until batch is full
+        while len(batch) < MAX_BATCH_SIZE:
+            # Move 4 — bounded wait inside
+            remaining = deadline - time.monotonic()
+
+            if remaining <= 0:
+                break
+
+            try:
+                req = await asyncio.wait_for(
+                    REQUEST_QUEUE.get(),
+                    timeout=remaining
+                )
+                req.t_batch_entry = time.monotonic()
+                batch.append(req)
+
+            # Move 5 — timeout means window closed
+            except asyncio.TimeoutError:
+                break
+        print(f"batch={len(batch)}")
+        # batch: list[GenRequest] = []  # <-- placeholder only, so STEP B parses; STEP A fills it
+        # NOTE: until STEP A is written, batch stays empty and this loop spins
+        # without ever awaiting — write STEP A before running the server.
+
+        # ---------------- STEP B: RUN PHASE (implemented) ----------------
+        # FUTURE: results = runner.generate_batch(batch)
+        # TEMP: sequential fallback — replaced by batched forward pass in model_runner
+        # later. Per-request timing preserved; per-request try/except so one request
+        # failing must not affect the others in the batch.
+        for req in batch:
+            start = time.perf_counter()
+            try:
+                text,tokens_generated = runner.generate_text(
+                    prompt=req.prompt,
+                    max_tokens=req.max_tokens,
+                    temperature=req.temperature,
+                    )
+                latency_ms = (time.perf_counter() - start) * 1000.0
+                response = GenerateResponse(
+                    text=text,
+                    tokens_generated=tokens_generated,
+                    latency_ms=latency_ms,
+                    )
+                # METRICS STEP 3: stamp t_completion just before set_result
+                req.t_completion = time.monotonic()
+                req.future.set_result(response)
+            except Exception as e:
+                req.future.set_exception(e)
+
+            finally:
+                REQUEST_QUEUE.task_done()
 
 
 # --------------------------- app lifecycle (plumbing) --------------------------- #
@@ -169,7 +220,7 @@ async def lifespan(app: FastAPI):
     # --- startup ---
     logger.info("Starting up — loading model ...")
     app.state.runner = ModelRunner()  # load weights once; reused for every request
-
+    # app.state.runner = FakeRunner()
     # Launch the single background worker. create_task() SCHEDULES the worker()
     # coroutine to run concurrently on the event loop and returns IMMEDIATELY with a
     # Task handle — it does not block or run the worker inline here. We stash the
@@ -245,17 +296,24 @@ async def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
     #   - (if you used set_exception in the worker, the await re-raises it here.)
     """
     future = asyncio.get_running_loop().create_future()
+    # METRICS STEP 1: stamp t_arrival = time.monotonic() at birth of GenRequest
     gen_req = GenRequest(
         prompt = req.prompt,
         max_tokens = req.max_tokens,
         temperature = req.temperature,
         future = future
     )
+    gen_req.t_arrival = time.monotonic()
     try:
         REQUEST_QUEUE.put_nowait(gen_req) #no await needed if you were doing .put() the you would have needed await 
     except asyncio.QueueFull:
         raise HTTPException(status_code=503, detail="server overloaded, try again later")
     returned_future = await gen_req.future
+    # METRICS STEP 4: compute latency_ms = (t_completion - t_arrival) * 1000
+    # METRICS STEP 5: add tokens_generated + latency_ms to the response model/dict
+    #   (GenerateResponse already declares both fields — see lines ~52-53 — so the
+    #   plumbing is in place; this is just where you populate them. Your logic.)
+    returned_future.latency_ms = (gen_req.t_completion - gen_req.t_arrival) * 1000
     return returned_future
 
     raise NotImplementedError(
