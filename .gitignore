@@ -1,0 +1,31 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Claude Code local (machine-specific) settings
+.claude/settings.local.json
+
+# Secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+secrets.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Benchmark raw output (keep summarized RESULTS.md, drop raw dumps)
+# results/raw/

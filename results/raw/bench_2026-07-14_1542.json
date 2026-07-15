@@ -1,0 +1,188 @@
+{
+  "timestamp": "2026-07-14_1542",
+  "git_commit": "4ce0084519f85f5288f3abe39ef231c056d655f4",
+  "device": "Tesla T4",
+  "device_type": "cuda",
+  "torch_version": "2.8.0+cu128",
+  "model_id": "Qwen/Qwen2.5-1.5B",
+  "workload": {
+    "n_prompts": 8,
+    "max_new_tokens": 32,
+    "temperature": 0,
+    "token_budget": 256,
+    "warmup_runs": 2,
+    "timed_reps": 3,
+    "prompts": [
+      "Hi",
+      "The capital of France is",
+      "Once upon a time",
+      "In machine learning, the term overfitting refers to",
+      "Write a short poem about the ocean at dawn.",
+      "Explain how a transformer neural network processes a sequence of tokens, step by step.",
+      "List three reasons why distributed systems are hard to debug in production environments.",
+      "The quick brown fox jumps over the lazy dog and then"
+    ]
+  },
+  "configs": [
+    {
+      "label": "generate_batch (batch=1)",
+      "reps": [
+        {
+          "rep": 1,
+          "wall_seconds": 11.387600866000184,
+          "total_tokens": 256,
+          "tokens_per_sec": 22.48059121604235
+        },
+        {
+          "rep": 2,
+          "wall_seconds": 11.43840292799996,
+          "total_tokens": 256,
+          "tokens_per_sec": 22.38074682378429
+        },
+        {
+          "rep": 3,
+          "wall_seconds": 11.256279717000098,
+          "total_tokens": 256,
+          "tokens_per_sec": 22.74286055750455
+        }
+      ],
+      "summary": {
+        "mean_tokens_per_sec": 22.534732865777062,
+        "min_tokens_per_sec": 22.38074682378429,
+        "max_tokens_per_sec": 22.74286055750455,
+        "mean_wall_seconds": 11.360761170333413
+      },
+      "kind": "batch",
+      "batch_size": 1,
+      "num_calls": 8
+    },
+    {
+      "label": "generate_batch (batch=2)",
+      "reps": [
+        {
+          "rep": 1,
+          "wall_seconds": 5.313714906000087,
+          "total_tokens": 256,
+          "tokens_per_sec": 48.177217733479175
+        },
+        {
+          "rep": 2,
+          "wall_seconds": 5.086069316000021,
+          "total_tokens": 256,
+          "tokens_per_sec": 50.3335648994523
+        },
+        {
+          "rep": 3,
+          "wall_seconds": 5.183956528999943,
+          "total_tokens": 256,
+          "tokens_per_sec": 49.383130157032
+        }
+      ],
+      "summary": {
+        "mean_tokens_per_sec": 49.29797092998783,
+        "min_tokens_per_sec": 48.177217733479175,
+        "max_tokens_per_sec": 50.3335648994523,
+        "mean_wall_seconds": 5.19458025033335
+      },
+      "kind": "batch",
+      "batch_size": 2,
+      "num_calls": 4
+    },
+    {
+      "label": "generate_batch (batch=4)",
+      "reps": [
+        {
+          "rep": 1,
+          "wall_seconds": 2.5694986239998343,
+          "total_tokens": 256,
+          "tokens_per_sec": 99.63033161757261
+        },
+        {
+          "rep": 2,
+          "wall_seconds": 2.7663629880000826,
+          "total_tokens": 256,
+          "tokens_per_sec": 92.54027801502394
+        },
+        {
+          "rep": 3,
+          "wall_seconds": 2.5244246739998744,
+          "total_tokens": 256,
+          "tokens_per_sec": 101.409244901087
+        }
+      ],
+      "summary": {
+        "mean_tokens_per_sec": 97.85995151122785,
+        "min_tokens_per_sec": 92.54027801502394,
+        "max_tokens_per_sec": 101.409244901087,
+        "mean_wall_seconds": 2.620095428666597
+      },
+      "kind": "batch",
+      "batch_size": 4,
+      "num_calls": 2
+    },
+    {
+      "label": "generate_batch (batch=8)",
+      "reps": [
+        {
+          "rep": 1,
+          "wall_seconds": 1.7149740469999415,
+          "total_tokens": 256,
+          "tokens_per_sec": 149.27339597227663
+        },
+        {
+          "rep": 2,
+          "wall_seconds": 1.6840040520000912,
+          "total_tokens": 256,
+          "tokens_per_sec": 152.01863659172844
+        },
+        {
+          "rep": 3,
+          "wall_seconds": 1.7755782100000488,
+          "total_tokens": 256,
+          "tokens_per_sec": 144.17838569892845
+        }
+      ],
+      "summary": {
+        "mean_tokens_per_sec": 148.49013942097784,
+        "min_tokens_per_sec": 144.17838569892845,
+        "max_tokens_per_sec": 152.01863659172844,
+        "mean_wall_seconds": 1.7248521030000272
+      },
+      "kind": "batch",
+      "batch_size": 8,
+      "num_calls": 1
+    },
+    {
+      "label": "sequential+KV-cache \u2014 different decode path, not baseline-comparable",
+      "reps": [
+        {
+          "rep": 1,
+          "wall_seconds": 10.362040766999826,
+          "total_tokens": 256,
+          "tokens_per_sec": 24.705558080343373
+        },
+        {
+          "rep": 2,
+          "wall_seconds": 10.283992062999914,
+          "total_tokens": 256,
+          "tokens_per_sec": 24.89305694050905
+        },
+        {
+          "rep": 3,
+          "wall_seconds": 10.087722160000112,
+          "total_tokens": 256,
+          "tokens_per_sec": 25.377384105114682
+        }
+      ],
+      "summary": {
+        "mean_tokens_per_sec": 24.9919997086557,
+        "min_tokens_per_sec": 24.705558080343373,
+        "max_tokens_per_sec": 25.377384105114682,
+        "mean_wall_seconds": 10.244584996666617
+      },
+      "kind": "context",
+      "batch_size": 1,
+      "num_calls": 8
+    }
+  ]
+}

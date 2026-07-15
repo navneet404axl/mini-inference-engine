@@ -35,7 +35,9 @@ def main():
         sequential_ids.append(seq_ids)
 
     # BATCHED ROAD — one call, raw ID bins.
-    batched_ids = runner._generate_batch_ids(PROMPTS, max_new_tokens=N_TOKENS)
+    # Stage 4: max_new_tokens is now per-prompt list[int]; replicate the single cap
+    # across all prompts to preserve the original 20-token verification semantics.
+    batched_ids = runner._generate_batch_ids(PROMPTS, max_new_tokens=[N_TOKENS] * len(PROMPTS))
 
     # COMPARE per prompt on the full ID lists.
     all_pass = True

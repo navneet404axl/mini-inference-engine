@@ -168,12 +168,8 @@ class ModelRunner:
                 if token_id == self.eos_token_id:    # stop early
                     break
                 outputs = self.model(next_token, past_key_values=past_key_values, use_cache=True)
-                past_key_values = outputs.past_key_values 
+                past_key_values = outputs.past_key_values
         return generated
-
-        raise NotImplementedError(
-            "generate_tokens is yours to implement — see the STEP comments above."
-        )
 
     # ------------------------------------------------------------------ #
     # STUB — YOU IMPLEMENT THIS (CLAUDE.md: the decode/token gen loop).   #
@@ -251,7 +247,7 @@ class ModelRunner:
     # ------------------------------------------------------------------ #
     # STUB — YOU IMPLEMENT THIS (CLAUDE.md: the batching logic).          #
     # ------------------------------------------------------------------ #
-    def _generate_batch_ids(self, prompts: list[str], max_new_tokens: int) -> list[list[int]]:
+    def _generate_batch_ids(self, prompts: list[str], max_new_tokens: list[int]) -> list[list[int]]:
         # STEP 1: Configure tokenizer for batching — padding side + pad token
         # TODO Jul 5: move tokenizer config to __init__ — mutating shared state per-call is a smell
         self.tokenizer.padding_side = "left"
@@ -282,8 +278,14 @@ class ModelRunner:
             # Home shape: flat [batch]; exactly ONE unsqueeze(1) at the cat.
             # DESIGN (locked Jul 7): Option A keep-and-ignore; EOS never collected;
             # flags = flip/filter/exit; mask grows +1s column per step.
-            for step in range(max_new_tokens):
+     
+            max_steps = max(max_new_tokens)
+            for step in range(max_steps):
+
                 # MOVE 1 — CHECK: compare this step's tokens (flat) against eos_token_id -> is_eos [batch] bool
+                for i in range(batch_size):
+                    if len(generated_tokens[i]) >= max_new_tokens[i]:
+                        finished[i] = True
                 is_eos = next_token_ids == self.eos_token_id    # bool [batch]
                 # MOVE 2 — COLLECT: per sequence i: if not finished AND not EOS -> append token into bin i
                 for i in range(batch_size):
@@ -294,7 +296,7 @@ class ModelRunner:
                 # MOVE 4 — EXIT: if all finished -> break
                 if finished.all().item():
                     break
-                if step == max_new_tokens - 1:
+                if step == max_steps - 1:
                     break
                 # MOVE 5 — GROW: unsqueeze tokens to [batch,1], cat onto input_ids (dim=1);
                 #                cat ones-column onto attention_mask (dtype + device must match)
@@ -319,7 +321,16 @@ class ModelRunner:
 # CHANGED Jul 9: was decode+return text here; now returns raw bins — split for verify_decode (option c), decode moved to public wrapper
 
 
-    def generate_batch(self, prompts: list[str], max_new_tokens: int) -> list[str]: 
+    def generate_batch(self, prompts: list[str], max_new_tokens: list[int]) -> list[tuple[str, int]]:
+        # RESERVED (Stage 4): decide return shape here — worker needs per-request
+        # token counts (bins hold them); either return richer data or let worker
+        # call _generate_batch_ids + decode separately.
         bins = self._generate_batch_ids(prompts,max_new_tokens)
-        return [self.tokenizer.decode(tokens, skip_special_tokens=True) for tokens in bins]
+        return [
+        (
+            self.tokenizer.decode(tokens, skip_special_tokens=True),
+            len(tokens),
+        )
+        for tokens in bins
+    ]
         

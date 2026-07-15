@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -53,6 +54,14 @@ class GenerateResponse(BaseModel):
     latency_ms: float
 
 
+# --------------------------- metrics: completed-request record (RESERVED) --------------------------- #
+@dataclass(frozen=True)
+class CompletedRequest:
+    total_latency_ms: float
+    tokens_generated: int
+    t_completion: float
+
+
 # class FakeRunner:
 #     def generate_text(self, prompt, max_tokens, temperature):
 #         time.sleep(0.05)  # pretend GPU work (blocking, like the real thing)
@@ -73,6 +82,9 @@ class GenerateResponse(BaseModel):
 # (Constructing the Queue at import time is fine on Python 3.10+: it binds to the
 # running loop lazily on first use, not here.)
 REQUEST_QUEUE: "asyncio.Queue[GenRequest]" = asyncio.Queue(maxsize=32)
+
+# sliding window of completed requests; oldest fall off automatically
+METRICS_WINDOW: "deque[CompletedRequest]" = deque(maxlen=1000)
 
 # CHANGED 2026-07-02: was no batching knobs (worker consumed one request at a time);
 # now the two dynamic-batching limits below; reason: worker's GRAB phase needs them.
@@ -154,13 +166,8 @@ async def worker(runner: ModelRunner) -> None:
         first_req = await REQUEST_QUEUE.get()
         first_req.t_batch_entry = time.monotonic()
         batch = [first_req]
-        # METRICS STEP 2: stamp t_batch_entry when request enters a batch
-        # (applies to BOTH the first_req above and each `req` appended in Move 4 —
-        # every request that joins `batch` gets its t_batch_entry set. Your logic.)
-
         # Move 2 — start fixed clock
         deadline = time.monotonic() + BATCH_WINDOW_S
-
         # Move 3 — accumulation loop: keep going until batch is full
         while len(batch) < MAX_BATCH_SIZE:
             # Move 4 — bounded wait inside
@@ -180,38 +187,49 @@ async def worker(runner: ModelRunner) -> None:
             # Move 5 — timeout means window closed
             except asyncio.TimeoutError:
                 break
-        print(f"batch={len(batch)}")
-        # batch: list[GenRequest] = []  # <-- placeholder only, so STEP B parses; STEP A fills it
-        # NOTE: until STEP A is written, batch stays empty and this loop spins
-        # without ever awaiting — write STEP A before running the server.
+            
+        prompts = [req.prompt for req in batch]
+        max_new_tokens = [req.max_tokens for req in batch]
+        start = time.perf_counter()
+        try:
+            results = runner.generate_batch(prompts=prompts,max_new_tokens=max_new_tokens)
+            model_latency_ms = (time.perf_counter() - start) * 1000.0
+            assert len(results) == len(batch)
 
-        # ---------------- STEP B: RUN PHASE (implemented) ----------------
-        # FUTURE: results = runner.generate_batch(batch)
-        # TEMP: sequential fallback — replaced by batched forward pass in model_runner
-        # later. Per-request timing preserved; per-request try/except so one request
-        # failing must not affect the others in the batch.
-        for req in batch:
-            start = time.perf_counter()
-            try:
-                text,tokens_generated = runner.generate_text(
-                    prompt=req.prompt,
-                    max_tokens=req.max_tokens,
-                    temperature=req.temperature,
-                    )
-                latency_ms = (time.perf_counter() - start) * 1000.0
-                response = GenerateResponse(
-                    text=text,
-                    tokens_generated=tokens_generated,
-                    latency_ms=latency_ms,
-                    )
-                # METRICS STEP 3: stamp t_completion just before set_result
+            for req, (text, tokens_generated) in zip(batch, results):
+                response = GenerateResponse(text=text,tokens_generated=tokens_generated,latency_ms=model_latency_ms)
                 req.t_completion = time.monotonic()
-                req.future.set_result(response)
-            except Exception as e:
-                req.future.set_exception(e)
+                assert req.t_arrival is not None
 
-            finally:
+                total_latency_ms = (req.t_completion - req.t_arrival) * 1000.0
+                METRICS_WINDOW.append(CompletedRequest(total_latency_ms=total_latency_ms,tokens_generated=tokens_generated,t_completion=req.t_completion,))
+                req.future.set_result(response)
+        except Exception as e:
+            for req in batch:
+                if not req.future.done():
+                    req.future.set_exception(e)
+        finally:
+            for _ in batch:
                 REQUEST_QUEUE.task_done()
+            # ---------------- STEP B (Stage 4): BATCHED RUN — RESERVED, Nony's hands ----------------
+        # INVARIANT: results[i] corresponds to batch[i] — generate_batch preserves prompt
+        # order (verified: tokenizer + bins are positional, nothing sorts). If ANY
+        # reordering is ever added (sort-by-length, continuous batching), positional
+        # zip breaks SILENTLY — add ID plumbing first.
+        #
+        # RESERVED steps:
+        #   1. Build parallel lists from batch: prompts, caps (req.max_tokens) — same order.
+        #   2. Call the runner's batched path (design decision: which layer(s) to call
+        #      to get BOTH texts and per-request token counts).
+        #   3. assert len(results) == len(batch)  — count-in == count-out tripwire.
+        #   4. Per request, IN ORDER: build GenerateResponse, stamp t_completion,
+        #      build CompletedRequest + append to METRICS_WINDOW, then set_result.
+        #      Bookkeeping before announcement, per request.
+        #   5. Batch-level failure policy: if the batched call raises, EVERY Future in
+        #      the batch must receive set_exception — zero orphans.
+        #   6. task_done() once per request, exactly as before.
+        # KNOWN LIMITATION (README): batched path is greedy — per-request temperature
+        # accepted by API but not applied. Verify-first decision; sampling = future work.
 
 
 # --------------------------- app lifecycle (plumbing) --------------------------- #
@@ -301,24 +319,23 @@ async def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
         prompt = req.prompt,
         max_tokens = req.max_tokens,
         temperature = req.temperature,
-        future = future
+        future = future,
+        t_arrival=time.monotonic()
     )
-    gen_req.t_arrival = time.monotonic()
+
     try:
         REQUEST_QUEUE.put_nowait(gen_req) #no await needed if you were doing .put() the you would have needed await 
     except asyncio.QueueFull:
         raise HTTPException(status_code=503, detail="server overloaded, try again later")
-    returned_future = await gen_req.future
+    response = await gen_req.future
     # METRICS STEP 4: compute latency_ms = (t_completion - t_arrival) * 1000
     # METRICS STEP 5: add tokens_generated + latency_ms to the response model/dict
     #   (GenerateResponse already declares both fields — see lines ~52-53 — so the
     #   plumbing is in place; this is just where you populate them. Your logic.)
-    returned_future.latency_ms = (gen_req.t_completion - gen_req.t_arrival) * 1000
-    return returned_future
-
-    raise NotImplementedError(
-        "generate (producer) is yours to implement — see the STEP comments above."
-    )
+    assert gen_req.t_completion is not None
+    assert gen_req.t_arrival is not None
+    response.latency_ms = (gen_req.t_completion - gen_req.t_arrival) * 1000
+    return response
 
 
 @app.post("/generate/stream")
@@ -370,6 +387,87 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
             "X-Accel-Buffering": "no",  # disable proxy buffering so tokens flush live
         },
     )
+
+
+# --------------------------- Core List: metrics math (STUBS) --------------------------- #
+def percentile(sorted_values: list[float], p: float) -> float | None:
+    """RESERVED. Pure math, no globals. Assumes input already sorted ascending.
+    Index convention: min(int(p * N), N - 1). Empty list -> None."""
+    ...
+    n = len(sorted_values)
+
+    if n == 0:
+        return None
+
+    idx = min(int(p * n), n - 1)
+
+    return sorted_values[idx]
+
+def compute_metrics() -> dict:
+    """RESERVED. Walks METRICS_WINDOW once: extract latencies, sort ONCE,
+    call percentile() for p50/p95/p99; sum tokens_generated; span =
+    newest t_completion - oldest t_completion; tokens_per_sec = None if
+    fewer than 2 records; percentiles None if empty; always include
+    sample_count. Returns dict: p50_ms, p95_ms, p99_ms, sample_count,
+    tokens_per_sec."""
+    ...
+    latencies: list[float] = []
+    total_tokens = 0
+    oldest_t_completion: float | None = None
+    newest_t_completion: float | None = None
+
+    for record in METRICS_WINDOW:
+        latencies.append(record.total_latency_ms)
+        total_tokens += record.tokens_generated
+
+        if oldest_t_completion is None:
+            oldest_t_completion = record.t_completion
+
+        newest_t_completion = record.t_completion
+
+    sample_count = len(latencies)
+
+    if sample_count == 0:
+        return {
+            "p50_ms": None,
+            "p95_ms": None,
+            "p99_ms": None,
+            "sample_count": 0,
+            "tokens_per_sec": None,
+        }
+
+    latencies.sort()
+
+    p50_ms = percentile(latencies, 0.50)
+    p95_ms = percentile(latencies, 0.95)
+    p99_ms = percentile(latencies, 0.99)
+
+    if sample_count < 2:
+        tokens_per_sec = None
+    else:
+        assert oldest_t_completion is not None
+        assert newest_t_completion is not None
+
+        span = newest_t_completion - oldest_t_completion
+
+        if span <= 0:
+            tokens_per_sec = None
+        else:
+            tokens_per_sec = total_tokens / span
+
+    return {
+        "p50_ms": p50_ms,
+        "p95_ms": p95_ms,
+        "p99_ms": p99_ms,
+        "sample_count": sample_count,
+        "tokens_per_sec": tokens_per_sec,
+    }
+
+@app.get("/metrics")
+def metrics() -> dict:
+    out = compute_metrics()
+    out["queue_depth"] = REQUEST_QUEUE.qsize()
+    return out
 
 
 if __name__ == "__main__":
