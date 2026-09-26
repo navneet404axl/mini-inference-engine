@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Callable
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -283,10 +284,23 @@ class ModelRunner:
     # ------------------------------------------------------------------ #
     # Batched decode (Step 3) — the throughput win.                       #
     # ------------------------------------------------------------------ #
-    def _generate_batch_ids(self, prompts: list[str], max_new_tokens: list[int]) -> list[list[int]]:
+    def _generate_batch_ids(
+        self,
+        prompts: list[str],
+        max_new_tokens: list[int],
+        on_token: Callable[[int, int], None] | None = None,
+    ) -> list[list[int]]:
         """Decode N prompts together, one forward pass per step for the whole batch.
 
         Input:  prompts (len N) and max_new_tokens (len N, per-request budgets).
+                on_token (optional) — per-token hook for streaming (Stage 4,
+                step 1.2). Called as on_token(i, token_id) the moment row i
+                COLLECTS a token, i.e. only for tokens that will also land in
+                generated_tokens[i] (never EOS, never a finished row). None =
+                no streaming; the loop must behave exactly as before.
+                It runs on WHATEVER THREAD this method runs on (the worker's
+                executor thread), so it must never touch asyncio objects
+                directly — that is the caller's problem, not this file's.
         Output: N lists of new token ids, IN THE SAME ORDER as `prompts`.
 
         ORDER IS A CONTRACT. main.py's worker zips these results back onto the
@@ -380,7 +394,15 @@ class ModelRunner:
                 # finished rows still compute, they just stop contributing.
                 for i in range(batch_size):
                     if not finished[i] and not is_eos[i]:
-                        generated_tokens[i].append(next_token_ids[i].item())
+                        token_id = next_token_ids[i].item()
+                        generated_tokens[i].append(token_id)
+                        # STREAM HOOK (Stage 4): the one spot that already knows
+                        # row -> token AND has filtered EOS/finished rows, so the
+                        # hook sees exactly the tokens that land in the bins.
+                        # Reuses the int above — a second .item() would be a
+                        # second GPU->CPU sync per token.
+                        if on_token is not None:
+                            on_token(i, token_id)
                 # MOVE 3 — LATCH: OR in the EOS flags; once True, stays True.
                 finished = finished | is_eos
                 # MOVE 4 — EXIT: everyone done, nothing left worth computing.
@@ -418,7 +440,12 @@ class ModelRunner:
         return generated_tokens
 
 
-    def generate_batch(self, prompts: list[str], max_new_tokens: list[int]) -> list[tuple[str, int]]:
+    def generate_batch(
+        self,
+        prompts: list[str],
+        max_new_tokens: list[int],
+        on_token: Callable[[int, int], None] | None = None,
+    ) -> list[tuple[str, int]]:
         """Public batched entry point — what main.py's worker calls.
 
         Returns one (text, tokens_generated) tuple per prompt, in prompt order.
@@ -427,8 +454,10 @@ class ModelRunner:
         because that is the true amount of model work done for that request.
         Counting after decode would undercount (skip_special_tokens drops
         tokens) and would not be comparable to the single-prompt path.
+
+        on_token is passed straight through to _generate_batch_ids (see there).
         """
-        bins = self._generate_batch_ids(prompts,max_new_tokens)
+        bins = self._generate_batch_ids(prompts, max_new_tokens, on_token=on_token)
         return [
         (
             self.tokenizer.decode(tokens, skip_special_tokens=True),

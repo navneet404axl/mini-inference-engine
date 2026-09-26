@@ -22,9 +22,9 @@ v0 — one request, one thread.
     over one GPU, and nothing bounded how many could pile up.
 
 v1 — streaming (/generate/stream).
-    Proved the decode loop could emit tokens incrementally over SSE. Still
-    talked to the model directly — and it still does today (see the note on
-    that endpoint), because a single Future can't carry a token stream.
+    Proved the decode loop could emit tokens incrementally over SSE. It
+    talked to the model directly, bypassing the queue, because a single
+    Future can't carry a token stream (fixed in v5).
 
 v2 — producer/consumer (the big structural change).
     Every /generate call became a PRODUCER: it packs its prompt + params + a
@@ -53,6 +53,14 @@ v4 — metrics.
     are recorded in a fixed-size window, and /metrics reports p50/p95/p99 +
     tokens/sec + queue depth. Percentiles, not averages, because tail latency
     is the number that actually describes a serving system.
+
+v5 — streaming through the worker + TTFT/TPOT.
+    The batched decode grew an on_token(i, token_id) hook. The worker runs the
+    batch on a thread (asyncio.to_thread) so the event loop stays live, and
+    the hook pushes each request's text into its own sink (an asyncio.Queue)
+    via loop.call_soon_threadsafe. /generate/stream now shares the queue,
+    backpressure and batching with /generate. The same hook stamps the first
+    token, so /metrics reports TTFT and TPOT percentiles for both endpoints.
 """
 
 from __future__ import annotations
@@ -64,6 +72,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Callable
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
@@ -108,6 +117,16 @@ class CompletedRequest:
     total_latency_ms: float
     tokens_generated: int
     t_completion: float
+    # Stage 4 streaming metrics. Optional because they are not always defined:
+    #   ttft_ms — arrival -> first token. None if the request produced no token.
+    #   tpot_ms — average gap between tokens AFTER the first:
+    #             (t_completion - t_first_token) / (tokens - 1).
+    #             None for 0 or 1 tokens (no gap to measure).
+    # TTFT is dominated by queue wait + batch window + prefill; TPOT by decode
+    # step time (which grows with batch size). Separating them is what tells
+    # you WHICH phase to optimize.
+    ttft_ms: float | None = None
+    tpot_ms: float | None = None
 
 
 # --------------------------- the queue --------------------------- #
@@ -166,20 +185,100 @@ class GenRequest:
     # producer. It must be created on the running loop, so the producer makes
     # it and passes it in here — one fresh Future per request, so results can
     # never cross wires between clients.
-    future: "asyncio.Future[GenerateResponse]"
+    #
+    # Stage 4: a request now carries EXACTLY ONE of two reply channels:
+    #   future — /generate: one value, delivered once at the end.
+    #   sink   — /generate/stream: many values (text chunks), then a None
+    #            end-of-stream sentinel. `loop` is the event loop that owns the
+    #            sink; the worker's executor thread needs it for
+    #            loop.call_soon_threadsafe(), because asyncio.Queue is NOT
+    #            thread-safe and must only be touched from its own loop.
+    future: "asyncio.Future[GenerateResponse] | None" = None
+    sink: "asyncio.Queue[str | None] | None" = None
+    loop: asyncio.AbstractEventLoop | None = None
 
     # --- metrics timestamps (monotonic clock; optional so each stage can stamp
     #     only the one it owns) ---
     t_arrival: float | None = None       # stamped by /generate the moment the request is born
     t_batch_entry: float | None = None   # stamped by worker() when this request is pulled into a batch
-    t_first_token: float | None = None   # reserved for TTFT; nothing writes it yet — the batched
-                                         # path has no per-request first-token hook (see model_runner)
+    t_first_token: float | None = None   # stamped by make_on_token's callback (worker thread) on
+                                         # this request's first collected token — feeds TTFT
     t_completion: float | None = None    # stamped by worker() just before set_result
 
     # Reading these tells you WHERE time went, which is the whole reason they
     # exist as separate fields:
     #   t_batch_entry - t_arrival     = time spent queued (server is saturated)
     #   t_completion  - t_batch_entry = batch wait + GPU time (model is slow)
+
+
+# --------------------------- stream routing --------------------------- #
+def make_on_token(batch: list[GenRequest], runner: ModelRunner) -> Callable[[int, int], None]:
+    """
+    Build the per-token callback handed to runner.generate_batch(on_token=...).
+
+    Input:
+      - batch:  the requests in THIS forward pass, in batch order. Row i of
+                the runner == batch[i] (same positional contract as results).
+      - runner: for runner.tokenizer (text is decoded HERE, in the worker
+                thread — the sink carries text, not ids, so the tokenizer
+                never runs on the event loop).
+    Output:
+      - a function on_token(i, token_id) -> None.
+
+    WHERE IT RUNS: inside the executor thread, once per collected token, in the
+    middle of the decode loop. So it must be cheap, and it must never touch an
+    asyncio object directly — only via req.loop.call_soon_threadsafe(...).
+
+    INCREMENTAL DETOKENIZATION (the prefix/read-offset trick, as in HF TGI):
+    decoding one token in isolation is wrong for byte-level BPE — a single
+    character (emoji, accented letter, CJK) can span several tokens, and some
+    tokens only get their leading space right in context. So per row we keep:
+        ids          — every id generated so far
+        prefix_off   — start of a small context window already sent
+        read_off     — end of what has been sent
+    Each token: decode ids[prefix_off:read_off] and ids[prefix_off:], and emit
+    only the part the second has beyond the first. If that ends in U+FFFD the
+    character is still incomplete — hold it back until the next token finishes
+    it. Cost stays O(window) per token instead of re-decoding the whole
+    sequence (which would be O(n^2) over a long generation).
+    """
+    n = len(batch)
+    ids: list[list[int]] = [[] for _ in range(n)]
+    prefix_off = [0] * n
+    read_off = [0] * n
+
+    def on_token(i: int, token_id: int) -> None:
+        req = batch[i]
+
+        # TTFT stamp for EVERY request, streamed or not — same monotonic clock
+        # as t_arrival so the subtraction in the worker is meaningful. A plain
+        # attribute write from this thread is safe: the event loop only reads
+        # it after the batch's await returns, i.e. after this thread is done.
+        if req.t_first_token is None:
+            req.t_first_token = time.monotonic()
+
+        # Non-stream requests stop here: their text is decoded once, at the
+        # end, by generate_batch. No point paying for tokenizer work twice.
+        if req.sink is None:
+            return
+
+        ids[i].append(token_id)
+        tok = runner.tokenizer
+        prefix_text = tok.decode(ids[i][prefix_off[i]:read_off[i]], skip_special_tokens=True)
+        new_text = tok.decode(ids[i][prefix_off[i]:], skip_special_tokens=True)
+
+        if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
+            chunk = new_text[len(prefix_text):]
+            prefix_off[i] = read_off[i]
+            read_off[i] = len(ids[i])
+            # asyncio.Queue is not thread-safe: schedule the put ON the loop
+            # that owns the sink. call_soon_threadsafe also wakes that loop.
+            assert req.loop is not None
+            req.loop.call_soon_threadsafe(req.sink.put_nowait, chunk)
+        # else: incomplete character (or a token that decodes to nothing) —
+        # emit nothing now; the next token's decode will include it.
+
+    return on_token
 
 
 # --------------------------- the worker --------------------------- #
@@ -262,8 +361,29 @@ async def worker(runner: ModelRunner) -> None:
         prompts = [req.prompt for req in batch]
         max_new_tokens = [req.max_tokens for req in batch]
         start = time.perf_counter()
+        # Requests whose reply channel is already closed. Lets the failure
+        # path below know which sinks still need a terminator.
+        closed: set[int] = set()
         try:
-            results = runner.generate_batch(prompts=prompts,max_new_tokens=max_new_tokens)
+            # The hook is ALWAYS passed (not just when a sink is present) so
+            # /generate requests get a TTFT stamp too.
+            on_token = make_on_token(batch, runner)
+
+            # OFF THE EVENT LOOP (Stage 4). generate_batch is synchronous and
+            # takes seconds; called inline it froze the whole event loop for
+            # the entire batch — no SSE frame could flush, /health hung, and
+            # new requests couldn't even reach put_nowait (so the 503 policy
+            # never fired mid-batch; clients just stalled at the socket).
+            # to_thread runs it on a worker thread while this coroutine
+            # awaits. The GPU is still driven by exactly one caller — this
+            # worker awaits the batch before grabbing the next — so nothing
+            # races for the device; we only freed the loop.
+            results = await asyncio.to_thread(
+                runner.generate_batch,
+                prompts=prompts,
+                max_new_tokens=max_new_tokens,
+                on_token=on_token,
+            )
             # Model time for the batch as a whole. Every member of the batch
             # gets the same number here — it is the cost of the shared pass,
             # not a per-request measurement. The per-request end-to-end number
@@ -284,16 +404,56 @@ async def worker(runner: ModelRunner) -> None:
                 # handler immediately, so anything we still need to do must
                 # already be done.
                 total_latency_ms = (req.t_completion - req.t_arrival) * 1000.0
-                METRICS_WINDOW.append(CompletedRequest(total_latency_ms=total_latency_ms,tokens_generated=tokens_generated,t_completion=req.t_completion,))
-                req.future.set_result(response)
+                ttft_ms = None
+                tpot_ms = None
+                if req.t_first_token is not None:
+                    ttft_ms = (req.t_first_token - req.t_arrival) * 1000.0
+                    if tokens_generated >= 2:
+                        tpot_ms = (req.t_completion - req.t_first_token) * 1000.0 / (tokens_generated - 1)
+                METRICS_WINDOW.append(CompletedRequest(
+                    total_latency_ms=total_latency_ms,
+                    tokens_generated=tokens_generated,
+                    t_completion=req.t_completion,
+                    ttft_ms=ttft_ms,
+                    tpot_ms=tpot_ms,
+                ))
+
+                # ROUTE THE ENDING by reply channel.
+                #   future -> one value, as before.
+                #   sink   -> its text already went out token by token; all it
+                #             needs now is the None end-of-stream sentinel.
+                # This line runs ON the event loop (we're past the await), so a
+                # direct put_nowait is correct here.
+                #
+                # ORDERING: can None overtake a token? No. Every token put was
+                # scheduled with call_soon_threadsafe BEFORE generate_batch
+                # returned, and to_thread delivers its result to this coroutine
+                # through the same loop's FIFO callback queue — so all token
+                # puts run before this coroutine even resumes.
+                if req.sink is not None:
+                    req.sink.put_nowait(None)
+                else:
+                    assert req.future is not None
+                    req.future.set_result(response)
+                closed.add(id(req))
         except Exception as e:
             # Batch-level failure policy: ZERO ORPHANS. If the shared call
             # blows up, every Future in the batch must be completed, or those
             # clients hang forever on an await that will never resolve. The
             # done() guard covers a partial failure — some Futures may already
             # be resolved from the loop above, and set_result twice raises.
+            # ZERO ORPHANS applies to streams too: a sink that never gets a
+            # terminator leaves its client hanging on sink.get() forever. A
+            # stream gets the exception object itself as its last item; the
+            # handler turns it into an SSE error frame. `closed` skips requests
+            # already finished before the failure (partial success).
+            logger.exception("batch of %d failed", len(batch))
             for req in batch:
-                if not req.future.done():
+                if id(req) in closed:
+                    continue
+                if req.sink is not None:
+                    req.sink.put_nowait(e)
+                elif req.future is not None and not req.future.done():
                     req.future.set_exception(e)
         finally:
             # One task_done() per get(), success or failure — the queue's
@@ -426,54 +586,76 @@ async def generate_stream(req: GenerateRequest, request: Request) -> StreamingRe
     Future — a Future delivers one value, a stream delivers many.
 
     THE HAND-OFF (whose code is whose):
-      - decode thread (yours, via run_in_executor): PRODUCES tokens into the sink
-        with loop.call_soon_threadsafe(sink.put_nowait, token), then pushes a
-        single None to mark end-of-stream.
+      - worker thread (asyncio.to_thread): make_on_token's callback PRODUCES
+        text chunks into the sink with loop.call_soon_threadsafe(sink.put_nowait,
+        chunk); the worker pushes a single None to mark end-of-stream.
       - THIS handler: CONSUMES the sink and frames each token onto the wire. It
         does no model work and no blocking work — hence `async def` (v1 was sync
         `def` because it drove the GPU inline; this one only awaits a Queue, so
         it belongs on the event loop where one thread serves many live streams).
 
-    WIRE FORMAT (SSE) — this is the contract test_stream.py parses; the body you
-    fill in below must emit exactly this:
+    WIRE FORMAT (SSE) — this is the contract test_stream.py parses:
       data: {"text": "<chunk>"}\n\n      <- one frame per token
       ...
       data: [DONE]\n\n                    <- terminal sentinel (sink yielded None)
+    On batch failure, a single  data: {"error": "..."}  frame precedes [DONE].
+
+    NOTE: the batched path is greedy, so `temperature` is accepted but not
+    applied here (it was when this endpoint drove stream_tokens directly).
 
     Each chunk is JSON-encoded (not raw text) so a token containing newlines or
     quotes can't corrupt the SSE framing — a raw newline would end the frame
     early. `json.dumps` is already imported at the top of this file.
     """
-    # STEP 1 — CREATE THE SINK (your logic here)
-    #   Make a fresh asyncio.Queue on the running loop; this is THIS request's
-    #   private token channel. Grab the running loop too if the worker needs a
-    #   handle for call_soon_threadsafe. (yours — this is the sink creation)
+    # THE SINK: this request's private token channel. Unbounded on purpose —
+    # the producer is the worker thread, and it must NEVER block on a slow
+    # client (that would stall the whole batch for everyone). Its size is
+    # already bounded by max_tokens. The loop is captured so the worker thread
+    # can schedule puts onto it with call_soon_threadsafe.
+    loop = asyncio.get_running_loop()
+    sink: "asyncio.Queue[str | Exception | None]" = asyncio.Queue()
 
-    # STEP 2 — ENQUEUE THROUGH THE WORKER PATH (your logic here)
-    #   Build the in-flight request carrying the sink (instead of a Future),
-    #   stamp t_arrival, and put it on REQUEST_QUEUE using the SAME backpressure
-    #   policy /generate uses: put_nowait, and on asyncio.QueueFull raise
-    #   HTTPException(status_code=503, ...). (yours — the enqueue logic)
+    gen_req = GenRequest(
+        prompt=req.prompt,
+        max_tokens=req.max_tokens,
+        temperature=req.temperature,
+        sink=sink,
+        loop=loop,
+        t_arrival=time.monotonic(),
+    )
+
+    # Same backpressure policy as /generate. This runs BEFORE the
+    # StreamingResponse is returned, so a full queue is still a clean 503 —
+    # once streaming starts, the 200 status has already been sent.
+    try:
+        REQUEST_QUEUE.put_nowait(gen_req)
+    except asyncio.QueueFull:
+        raise HTTPException(status_code=503, detail="server overloaded, try again later")
 
     async def token_stream():
         """Async generator drained by StreamingResponse on the event loop.
 
-        Its only job: pull tokens off the sink until the None sentinel, framing
-        each as an SSE 'data:' line, then emit [DONE]. Keep at least one `yield`
-        in here — without a `yield` Python makes this a coroutine, not an async
-        generator, and StreamingResponse needs an async iterator.
+        Pull chunks off the sink until the None sentinel, framing each as an
+        SSE 'data:' line, then emit [DONE]. An Exception in the sink means the
+        batch failed: send an error frame, then [DONE], so the client always
+        sees a terminated stream.
+
+        CLIENT DISCONNECT: Starlette stops iterating and closes this
+        generator. The worker keeps pushing into the orphaned sink until the
+        request's max_tokens (the batch can't drop a row mid-flight — that's
+        what continuous batching fixes), then the sink is garbage collected.
+        Accepted cost: at most max_tokens of wasted row compute.
         """
-        # STEP 3 — DRAIN LOOP (your logic here)
-        #   Loop: token = await sink.get(); a None means the producer is done ->
-        #   break; otherwise yield  f"data: {json.dumps({'text': token})}\n\n".
-        #   Consider wrapping this in try/finally so a client that disconnects
-        #   mid-stream still unwinds cleanly (drain/cleanup is yours to decide).
+        while True:
+            item = await sink.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                yield f"data: {json.dumps({'error': str(item) or type(item).__name__})}\n\n"
+                break
+            yield f"data: {json.dumps({'text': item})}\n\n"
+        yield "data: [DONE]\n\n"
 
-        # STEP 4 — TERMINATE (your logic here)
-        #   After the sentinel, emit the terminal frame:  yield "data: [DONE]\n\n"
-        ...
-
-    # --- StreamingResponse setup is wired for you; only the body above is yours ---
     return StreamingResponse(
         token_stream(),
         media_type="text/event-stream",   # SSE: the browser/client reads discrete events
@@ -525,12 +707,17 @@ def compute_metrics() -> dict:
     the None below; the span <= 0 guard covers the case where a whole batch
     completes inside one clock tick.
 
-    Returns: p50_ms, p95_ms, p99_ms, sample_count, tokens_per_sec.
+    Returns: p50_ms, p95_ms, p99_ms, sample_count, tokens_per_sec, plus
+    ttft_p50/p95/p99_ms and tpot_p50/p95/p99_ms (Stage 4). TTFT/TPOT skip
+    records where they're undefined, so they can be None even when latency
+    isn't (e.g. a window of only 1-token requests has no TPOT).
     Everything except sample_count can be None when the window is too thin —
     the caller must treat "not enough data yet" as a real state, not zero.
     """
     ...
     latencies: list[float] = []
+    ttfts: list[float] = []
+    tpots: list[float] = []
     total_tokens = 0
     oldest_t_completion: float | None = None
     newest_t_completion: float | None = None
@@ -540,6 +727,10 @@ def compute_metrics() -> dict:
     for record in METRICS_WINDOW:
         latencies.append(record.total_latency_ms)
         total_tokens += record.tokens_generated
+        if record.ttft_ms is not None:
+            ttfts.append(record.ttft_ms)
+        if record.tpot_ms is not None:
+            tpots.append(record.tpot_ms)
 
         if oldest_t_completion is None:
             oldest_t_completion = record.t_completion
@@ -557,6 +748,12 @@ def compute_metrics() -> dict:
             "p99_ms": None,
             "sample_count": 0,
             "tokens_per_sec": None,
+            "ttft_p50_ms": None,
+            "ttft_p95_ms": None,
+            "ttft_p99_ms": None,
+            "tpot_p50_ms": None,
+            "tpot_p95_ms": None,
+            "tpot_p99_ms": None,
         }
 
     latencies.sort()
@@ -564,6 +761,11 @@ def compute_metrics() -> dict:
     p50_ms = percentile(latencies, 0.50)
     p95_ms = percentile(latencies, 0.95)
     p99_ms = percentile(latencies, 0.99)
+
+    # percentile() already returns None for an empty list, so "no record has a
+    # TTFT yet" falls out as None with no special case.
+    ttfts.sort()
+    tpots.sort()
 
     if sample_count < 2:
         tokens_per_sec = None
@@ -584,6 +786,12 @@ def compute_metrics() -> dict:
         "p99_ms": p99_ms,
         "sample_count": sample_count,
         "tokens_per_sec": tokens_per_sec,
+        "ttft_p50_ms": percentile(ttfts, 0.50),
+        "ttft_p95_ms": percentile(ttfts, 0.95),
+        "ttft_p99_ms": percentile(ttfts, 0.99),
+        "tpot_p50_ms": percentile(tpots, 0.50),
+        "tpot_p95_ms": percentile(tpots, 0.95),
+        "tpot_p99_ms": percentile(tpots, 0.99),
     }
 
 @app.get("/metrics")

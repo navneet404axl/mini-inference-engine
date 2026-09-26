@@ -1,45 +1,42 @@
 # Working Agreement for Claude Code
 
 ## Core rule
-This is a learning project. I (the human) must understand and be able to
-rebuild every core piece. Move fast on plumbing, slow on the parts that teach.
+This is a learning project. I (the human) must end up understanding and being
+able to rebuild every core piece. Claude is a **helping hand** in this project:
+it writes the code so the project gets finished, and it keeps a record so I
+can learn every piece afterwards.
 
-## Do NOT write (I write these myself — review/critique only):
+## Claude writes the code, including the core pieces
+Claude may fully implement everything, including the parts that teach:
 - The decode / token generation loop
 - The request queue logic and backpressure handling
-- The batching logic
+- The batching logic (static and continuous)
 - Metrics and percentile (p50/p95/p99) math
 - The benchmark harness design
 
-## Always do this for the parts I write myself:
-Instead of writing the implementation, scaffold it as STUBS for me to fill in:
-- Write the function/class name and signature
-- Write a docstring explaining what it should do, the inputs, and the outputs
-- Add inline comments marking each step: "# STEP 1: ... (your logic here)"
-- Explain WHERE my logic goes and WHAT approach to consider — but do NOT
-  write the actual logic. Leave it for me.
-- If I ask, give hints or pseudocode, but let me write the real code.
+Plus all the plumbing: FastAPI routes, Pydantic models, Dockerfile, config
+files, requirements.txt, logging, project structure, plotting code.
 
-Example of what I want:
-    def generate_tokens(model, input_ids, max_tokens, temperature):
-        """
-        Run the autoregressive decode loop.
-        Input: model, starting token IDs, how many to generate, temperature.
-        Output: list of generated token IDs.
-        """
-        # STEP 1: set up the KV cache / initial state (your logic here)
-        # STEP 2: loop max_tokens times (your logic here)
-        #   - run a forward pass on the latest token
-        #   - take logits[-1], apply temperature, softmax, sample
-        #   - append the new token, feed it back
-        # STEP 3: return the generated tokens
-        pass
+## Always do this for core pieces: keep the learning log
+Every time Claude writes or changes a core piece, add an entry to
+`LEARNING_LOG.md` covering:
+- **What** was built, and where (file + function)
+- **Why** it's built that way: the design choice and the alternatives rejected
+- **The concept** behind it, explained so I could rebuild it from scratch
+- **"Check yourself" questions** I should be able to answer in an interview
+- **How it was verified**: tests run and results
 
-## Free to fully write (boilerplate — just do it):
-- FastAPI route scaffolding and request/response models (Pydantic)
-- Dockerfile, config files, requirements.txt
-- Logging setup, project structure
-- Plotting/charting code for benchmarks
+Code comments should explain the WHY, matching the existing style in
+`main.py` and `model_runner.py`.
+
+Once the project is finished, Claude teaches me from `LEARNING_LOG.md`, piece
+by piece. If I ask for hints or pseudocode instead of full code on something,
+do that.
 
 ## Before implementing anything non-trivial:
-Ask me for my design first. Tell me the tradeoffs, let me decide.
+Ask me for my design first. Tell me the tradeoffs, recommend one, let me decide.
+
+## Always verify
+Run the code before calling it done: `verify_decode.py` for any decode change,
+`test_stream.py` for streaming, and a concurrent load check for queue/batching
+changes. Report real results, including failures.
