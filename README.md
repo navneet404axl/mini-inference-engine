@@ -20,6 +20,24 @@ GET /metrics
 5. (Week 3) Batcher — groups concurrent requests into one forward pass
 6. Metrics — records timings at each stage
 
+## Schedulers
+Pick with the `SCHEDULER` env var (default `continuous`):
+- `continuous`: iteration-level scheduling (`continuous_batch.py`). Batch
+  membership is re-decided every decode step: finished requests leave
+  immediately and waiting ones join on the next step. Per-request temperature
+  is applied, and disconnected streams are evicted.
+- `static`: fixed batches (`MAX_BATCH_SIZE`, `BATCH_WINDOW_S`), greedy only.
+  Kept as the benchmark baseline.
+
+```
+SCHEDULER=static python main.py
+```
+
+## Verification
+- `python verify_decode.py`: static batched decode == single-sequence decode
+- `python verify_continuous.py`: continuous batching (staggered join/leave) == single-sequence decode
+- `python test_stream.py`: `/generate/stream` delivers tokens incrementally
+
 ## In scope for v1
 Single model, single GPU, streaming, dynamic batching, metrics endpoint
 

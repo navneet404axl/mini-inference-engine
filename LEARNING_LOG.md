@@ -100,3 +100,112 @@ frame, and no request hangs. `verify_decode` 4/4.
   mid-batch). **Continuous batching fixes this.**
 - Static batching: short requests wait for the longest in their batch.
   **Continuous batching fixes this too.** That's the next stage.
+
+---
+
+## Stage 5 — Continuous batching (2026-09-26)
+
+**Files:** `continuous_batch.py` (new: the `ContinuousBatch` engine),
+`main.py` (`continuous_worker`, shared helpers `route_token` /
+`complete_request` / `fail_request`, `StreamDecoder`, `SCHEDULER` switch),
+`verify_continuous.py` (new correctness test).
+
+**Verified (CPU, fp32):**
+- `verify_continuous.py`: 6 requests joining and leaving at staggered steps
+  (join into empty batch, join a longer cache, join a shorter cache, finish
+  inside prefill, leave-then-trim, join after trim). **All token IDs identical**
+  to the single-sequence path.
+- The same test with `position_ids` removed: rows A, B, C **fail**. That
+  proves the position fix is necessary, not decoration.
+- Head-of-line test (one 40-token request, then 3 × 4-token requests 1 s later):
+  shorts took **14.7 s static vs 3.2 s continuous (4.6× faster)**.
+- Mixed stream + non-stream: streamed text == `/generate` text on both schedulers.
+- Disconnect: the stream is evicted on the next step (`evicted 1 disconnected stream(s)`).
+- Temperature 1.2 gives 3 different outputs, temperature 0 gives identical ones.
+- Crash mid-step: every in-flight request gets an error, the queue counter
+  balances, and the worker survives.
+
+### The idea in one paragraph
+Static batching decides the batch **once**: it lives until its longest member
+finishes. Continuous (iteration-level) batching decides **before every decode
+step**: finished rows leave immediately, waiting requests join on the next
+step. From Orca (OSDI '22); it's the core of vLLM/TGI schedulers. The win is
+latency for short requests, better GPU occupancy, and no wasted rows.
+
+### Decision 1 — KV cache: merge/evict on membership events ✅
+- **Chosen:** one batched `DynamicCache`, left-padded. *Leave* =
+  `batch_select_indices` (keep surviving rows) + **trim** leading all-pad
+  columns. *Join* = prefill newcomers as their own mini-batch, left-pad both
+  caches to equal length, `torch.cat` on the batch dim. Copy cost is paid
+  only when membership changes, not every step. Works with stock HF.
+- **Rejected: per-request caches re-stacked every step.** Simplest to reason
+  about, but copies the whole cache every step, so throughput collapses as
+  contexts grow.
+- **Rejected (for now): paged KV cache (vLLM).** Fixed-size blocks + block
+  tables, zero padding waste. It's the "real" answer but needs a custom
+  attention kernel. It's the planned stretch goal.
+- **Check yourself:** why left padding and not right? What does `_trim`
+  prevent, and what would happen to memory without it?
+
+### Decision 2 — explicit per-row `position_ids` (the bug I caught before it happened)
+- Keys in the cache already have **RoPE baked in** at the position they were
+  computed at. A newcomer prefilled alone has keys at 0..p−1. Merged into an L-column
+  cache, the model's **default** position for its next token = L (it counts
+  columns), a false gap of L−p. Attention quietly degrades.
+- **Fix:** each row carries its own counter (= its count of real tokens), passed
+  as `position_ids` on every forward. Prefill uses `mask.cumsum(-1) − 1`.
+- **Why the static path never hit this:** everything was prefilled together,
+  and RoPE only cares about *relative* distance. Shifting a whole row by its
+  pad count changes nothing. The mismatch only appears when a row's keys and
+  its next query were computed under different offsets, which is exactly a merge.
+- **Check yourself:** explain why RoPE makes a constant shift harmless but a
+  merge harmful. Which rows failed without the fix, and why those?
+
+### Decision 3 — admission: every step, whenever slots are free ✅
+- **Chosen:** before each step, pull everything already waiting into free
+  slots (`get_nowait`, never wait for more). Block on the queue only when idle.
+- **Rejected: admit every K steps / when M are waiting.** Fewer merges and
+  smoother TPOT, but worse TTFT and two more knobs to tune.
+- **Known cost:** a newcomer's prefill runs while running rows wait, which
+  causes a TPOT blip for them. The standard fix is **chunked prefill** (split
+  long prompts across steps). Good future chart, good interview topic.
+- No `BATCH_WINDOW_S` in continuous mode: nobody waits for a batch to fill.
+
+### Decision 4 — keep static behind `SCHEDULER=static` ✅
+- Needed for the before/after benchmark on the same codebase (Stage 6).
+- The static path stays greedy on purpose: it's the verified baseline.
+
+### Decision 5 — per-row temperature sampling ✅
+- `sample_next(logits, temps)`: argmax for the whole batch, softmax/multinomial
+  for the whole batch, then `torch.where(temps > 0, ...)` picks per row. The
+  all-greedy case skips the softmax entirely.
+- The softmax runs in float32 because fp16 can underflow small probabilities.
+- Temperature 0 stays exact argmax, which is what lets the test compare IDs.
+
+### Decision 6 — rows keyed by the request object
+- The engine stores an opaque `key` per row; the worker passes the
+  `GenRequest` itself. No positional zip to break when rows leave and
+  indices shift. (The static path's positional contract was a known landmine.)
+- For the same reason `StreamDecoder` moved **onto the request**: a row's
+  index changes as others leave, the request doesn't.
+
+### Decision 7 — shared completion/failure helpers
+- `complete_request` / `fail_request` are used by both workers, so metrics
+  and zero-orphans logic exist once. `req.done` replaced the per-batch
+  `closed` set, because in continuous mode requests finish at different times.
+- Failure policy: snapshot everyone in flight *before* the risky calls. On
+  exception, fail them all, `reset()` the engine, and keep serving.
+
+### Decision 8 — disconnect eviction
+- The stream handler's `finally` sets `req.cancelled` if the stream didn't
+  finish. The continuous worker evicts such rows before the next step (and
+  skips cancelled newcomers before paying for their prefill).
+- Static can't do this (a fixed batch can't drop a row), which is another
+  point for continuous.
+
+### Check yourself (overall)
+- Walk one request through the continuous worker loop: ADMIT → EVICT →
+  PREFILL → STEP → RETIRE. Where can it wait, and for how long at most?
+- Why is `tokens.tolist()` once per step better than `.item()` per row?
+- What limits `MAX_BATCH_SIZE` now? (Hint: KV memory per row × context length.)
+- What would paged attention change about `_merge` / `_select` / `_trim`?

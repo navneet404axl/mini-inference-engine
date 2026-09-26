@@ -61,6 +61,14 @@ v5 — streaming through the worker + TTFT/TPOT.
     via loop.call_soon_threadsafe. /generate/stream now shares the queue,
     backpressure and batching with /generate. The same hook stamps the first
     token, so /metrics reports TTFT and TPOT percentiles for both endpoints.
+
+v6 — continuous batching (iteration-level scheduling).
+    continuous_worker + continuous_batch.ContinuousBatch decide batch
+    membership before EVERY decode step: finished rows leave immediately and
+    waiting requests join on the next step, with per-row position_ids so a
+    merged cache stays correct. Per-row temperature sampling, and
+    disconnected streams are evicted. The static worker is kept behind
+    SCHEDULER=static for side-by-side benchmarks.
 """
 
 from __future__ import annotations
@@ -68,6 +76,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -78,6 +87,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from continuous_batch import ContinuousBatch
 from model_runner import ModelRunner
 
 logging.basicConfig(level=logging.INFO)
@@ -158,8 +168,16 @@ METRICS_WINDOW: "deque[CompletedRequest]" = deque(maxlen=1000)
 #                     request is willing to wait for company. Too big and a
 #                     quiet server adds pure dead time to every request; too
 #                     small and bursts never get to batch at all.
-MAX_BATCH_SIZE = 8  # max requests per forward pass
-BATCH_WINDOW_S = 0.05  # accumulation deadline in seconds; clock starts at first arrival
+MAX_BATCH_SIZE = 8  # max requests per forward pass (both schedulers)
+BATCH_WINDOW_S = 0.05  # static only: accumulation deadline, clock starts at first arrival
+
+# Which scheduler drives the GPU (Stage 5). Both are kept so they can be
+# benchmarked against each other on the same codebase:
+#   "continuous" — iteration-level scheduling (continuous_worker). Default.
+#   "static"     — the original fixed batches (static_worker).
+# Continuous needs no BATCH_WINDOW_S: nobody waits for a batch to "fill";
+# a request joins the running batch on the very next decode step.
+SCHEDULER = os.getenv("SCHEDULER", "continuous")
 
 
 # --------------------------- request container --------------------------- #
@@ -201,90 +219,171 @@ class GenRequest:
     #     only the one it owns) ---
     t_arrival: float | None = None       # stamped by /generate the moment the request is born
     t_batch_entry: float | None = None   # stamped by worker() when this request is pulled into a batch
-    t_first_token: float | None = None   # stamped by make_on_token's callback (worker thread) on
-                                         # this request's first collected token — feeds TTFT
-    t_completion: float | None = None    # stamped by worker() just before set_result
+    t_first_token: float | None = None   # stamped by route_token (worker thread) on this
+                                         # request's first collected token — feeds TTFT
+    t_completion: float | None = None    # stamped by complete_request() just before the reply goes out
 
     # Reading these tells you WHERE time went, which is the whole reason they
     # exist as separate fields:
     #   t_batch_entry - t_arrival     = time spent queued (server is saturated)
     #   t_completion  - t_batch_entry = batch wait + GPU time (model is slow)
 
+    # --- lifecycle flags ---
+    # done: the reply channel has been closed (result, sentinel or error sent).
+    #   Guards against double-completion on partial failures.
+    # cancelled: set by the stream handler when its client disconnects. The
+    #   continuous worker evicts the row on the next step; the static worker
+    #   can't (a static batch can't drop a row mid-flight) and just ignores it.
+    done: bool = False
+    cancelled: bool = False
+    # Per-request incremental detokenizer, created on the first streamed token.
+    decoder: "StreamDecoder | None" = None
+
 
 # --------------------------- stream routing --------------------------- #
-def make_on_token(batch: list[GenRequest], runner: ModelRunner) -> Callable[[int, int], None]:
-    """
-    Build the per-token callback handed to runner.generate_batch(on_token=...).
+class StreamDecoder:
+    """Incremental detokenizer for ONE request (the prefix/read-offset trick, as in HF TGI).
 
-    Input:
-      - batch:  the requests in THIS forward pass, in batch order. Row i of
-                the runner == batch[i] (same positional contract as results).
-      - runner: for runner.tokenizer (text is decoded HERE, in the worker
-                thread — the sink carries text, not ids, so the tokenizer
-                never runs on the event loop).
-    Output:
-      - a function on_token(i, token_id) -> None.
-
-    WHERE IT RUNS: inside the executor thread, once per collected token, in the
-    middle of the decode loop. So it must be cheap, and it must never touch an
-    asyncio object directly — only via req.loop.call_soon_threadsafe(...).
-
-    INCREMENTAL DETOKENIZATION (the prefix/read-offset trick, as in HF TGI):
-    decoding one token in isolation is wrong for byte-level BPE — a single
+    Decoding one token in isolation is wrong for byte-level BPE: a single
     character (emoji, accented letter, CJK) can span several tokens, and some
-    tokens only get their leading space right in context. So per row we keep:
+    tokens only get their leading space right in context. So we keep:
         ids          — every id generated so far
         prefix_off   — start of a small context window already sent
         read_off     — end of what has been sent
     Each token: decode ids[prefix_off:read_off] and ids[prefix_off:], and emit
     only the part the second has beyond the first. If that ends in U+FFFD the
-    character is still incomplete — hold it back until the next token finishes
-    it. Cost stays O(window) per token instead of re-decoding the whole
-    sequence (which would be O(n^2) over a long generation).
+    character is still incomplete, so hold it back until the next token
+    finishes it. Cost stays O(window) per token instead of re-decoding the
+    whole sequence (which would be O(n^2) over a long generation).
+
+    Lives on the request (not keyed by batch row) because under continuous
+    batching a request's row index changes as other rows leave.
     """
-    n = len(batch)
-    ids: list[list[int]] = [[] for _ in range(n)]
-    prefix_off = [0] * n
-    read_off = [0] * n
+
+    def __init__(self, tokenizer) -> None:
+        self.tokenizer = tokenizer
+        self.ids: list[int] = []
+        self.prefix_off = 0
+        self.read_off = 0
+
+    def push(self, token_id: int) -> str | None:
+        """Add one token; return the newly completed text, or None if nothing is ready."""
+        self.ids.append(token_id)
+        prefix_text = self.tokenizer.decode(self.ids[self.prefix_off:self.read_off], skip_special_tokens=True)
+        new_text = self.tokenizer.decode(self.ids[self.prefix_off:], skip_special_tokens=True)
+        if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
+            self.prefix_off = self.read_off
+            self.read_off = len(self.ids)
+            return new_text[len(prefix_text):]
+        return None
+
+
+def route_token(req: GenRequest, token_id: int, tokenizer) -> None:
+    """Handle one collected token for one request. Runs on the WORKER THREAD.
+
+    Shared by both schedulers. Must be cheap (it runs inside the decode loop)
+    and must never touch an asyncio object directly, only via
+    req.loop.call_soon_threadsafe(...).
+    """
+    # TTFT stamp for EVERY request, streamed or not, on the same monotonic
+    # clock as t_arrival. A plain attribute write from this thread is safe: the
+    # event loop only reads it after the batch/step await returns.
+    if req.t_first_token is None:
+        req.t_first_token = time.monotonic()
+
+    # Non-stream requests stop here: their text is decoded once, at the end.
+    # Cancelled streams stop here too: nobody is reading the sink.
+    if req.sink is None or req.cancelled:
+        return
+
+    if req.decoder is None:
+        req.decoder = StreamDecoder(tokenizer)
+    chunk = req.decoder.push(token_id)
+    if chunk:
+        # asyncio.Queue is not thread-safe: schedule the put ON the loop that
+        # owns the sink. call_soon_threadsafe also wakes that loop.
+        assert req.loop is not None
+        req.loop.call_soon_threadsafe(req.sink.put_nowait, chunk)
+
+
+def make_on_token(batch: list[GenRequest], runner: ModelRunner) -> Callable[[int, int], None]:
+    """Static path: adapt route_token to the runner's positional on_token(i, token_id).
+
+    Row i of generate_batch == batch[i] (the same positional contract as its results).
+    """
+    tokenizer = runner.tokenizer
 
     def on_token(i: int, token_id: int) -> None:
-        req = batch[i]
-
-        # TTFT stamp for EVERY request, streamed or not — same monotonic clock
-        # as t_arrival so the subtraction in the worker is meaningful. A plain
-        # attribute write from this thread is safe: the event loop only reads
-        # it after the batch's await returns, i.e. after this thread is done.
-        if req.t_first_token is None:
-            req.t_first_token = time.monotonic()
-
-        # Non-stream requests stop here: their text is decoded once, at the
-        # end, by generate_batch. No point paying for tokenizer work twice.
-        if req.sink is None:
-            return
-
-        ids[i].append(token_id)
-        tok = runner.tokenizer
-        prefix_text = tok.decode(ids[i][prefix_off[i]:read_off[i]], skip_special_tokens=True)
-        new_text = tok.decode(ids[i][prefix_off[i]:], skip_special_tokens=True)
-
-        if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
-            chunk = new_text[len(prefix_text):]
-            prefix_off[i] = read_off[i]
-            read_off[i] = len(ids[i])
-            # asyncio.Queue is not thread-safe: schedule the put ON the loop
-            # that owns the sink. call_soon_threadsafe also wakes that loop.
-            assert req.loop is not None
-            req.loop.call_soon_threadsafe(req.sink.put_nowait, chunk)
-        # else: incomplete character (or a token that decodes to nothing) —
-        # emit nothing now; the next token's decode will include it.
+        route_token(batch[i], token_id, tokenizer)
 
     return on_token
 
 
-# --------------------------- the worker --------------------------- #
-async def worker(runner: ModelRunner) -> None:
+def complete_request(req: GenRequest, text: str, tokens_generated: int) -> None:
+    """Record metrics, then close the request's reply channel. Runs ON the event loop.
+
+    Shared by both schedulers. Bookkeeping BEFORE announcement: set_result()
+    can schedule the waiting handler immediately, so the metrics must already
+    be recorded.
+
+    ORDERING (streams): can the None sentinel overtake a token? No. Every
+    token put was scheduled with call_soon_threadsafe BEFORE the thread's call
+    returned, and to_thread delivers its result to the worker coroutine through
+    the same loop's FIFO callback queue, so all token puts run before the
+    worker even resumes and gets here.
     """
-    The single background consumer. Owns the GPU: it is the ONLY thing that
+    req.t_completion = time.monotonic()
+    assert req.t_arrival is not None
+    total_latency_ms = (req.t_completion - req.t_arrival) * 1000.0
+    ttft_ms = None
+    tpot_ms = None
+    if req.t_first_token is not None:
+        ttft_ms = (req.t_first_token - req.t_arrival) * 1000.0
+        if tokens_generated >= 2:
+            tpot_ms = (req.t_completion - req.t_first_token) * 1000.0 / (tokens_generated - 1)
+    METRICS_WINDOW.append(CompletedRequest(
+        total_latency_ms=total_latency_ms,
+        tokens_generated=tokens_generated,
+        t_completion=req.t_completion,
+        ttft_ms=ttft_ms,
+        tpot_ms=tpot_ms,
+    ))
+
+    # Route the ending by reply channel:
+    #   future -> the one value. latency_ms is overwritten by the producer with
+    #             its own end-to-end number; this one is the same measure.
+    #   sink   -> text already went out token by token; send the None sentinel.
+    if req.sink is not None:
+        req.sink.put_nowait(None)
+    else:
+        assert req.future is not None
+        req.future.set_result(GenerateResponse(
+            text=text, tokens_generated=tokens_generated, latency_ms=total_latency_ms,
+        ))
+    req.done = True
+
+
+def fail_request(req: GenRequest, exc: Exception) -> None:
+    """ZERO ORPHANS: close a request's channel with an error. Runs ON the event loop.
+
+    A Future gets set_exception (FastAPI turns it into a 500). A stream gets
+    the exception object as its last item; the handler turns it into an SSE
+    error frame. The done flag skips requests already completed before the
+    failure (partial success), because set_result twice would raise.
+    """
+    if req.done:
+        return
+    if req.sink is not None:
+        req.sink.put_nowait(exc)
+    elif req.future is not None and not req.future.done():
+        req.future.set_exception(exc)
+    req.done = True
+
+
+# --------------------------- worker: static batching --------------------------- #
+async def static_worker(runner: ModelRunner) -> None:
+    """
+    SCHEDULER=static. The single background consumer. Owns the GPU: it is the ONLY thing that
     calls the model on the /generate path, so all requests are serialized
     through here and nothing can race for the device. Runs forever until the
     shutdown hook cancels it.
@@ -350,20 +449,16 @@ async def worker(runner: ModelRunner) -> None:
         # INVARIANT: results[i] corresponds to batch[i] — generate_batch
         # preserves prompt order (verified: tokenizer + output bins are
         # positional, nothing sorts). If ANY reordering is ever introduced
-        # (sort-by-length bucketing, continuous batching), this positional zip
-        # breaks SILENTLY and clients get each other's text — add explicit id
-        # plumbing BEFORE any such change.
+        # (sort-by-length bucketing), this positional zip breaks SILENTLY and
+        # clients get each other's text. (The continuous worker avoids this by
+        # keying rows on the request object itself.)
         #
-        # KNOWN LIMITATION (also in README): the batched path is greedy. Per-
-        # request temperature is accepted by the API but not applied here.
-        # Deliberate: correctness of batching was verified first; batched
-        # sampling is future work.
+        # KNOWN LIMITATION: the static path is greedy. Per-request temperature
+        # is accepted by the API but not applied here. Kept that way on
+        # purpose: this path is the verified baseline for benchmarks. The
+        # continuous path applies temperature per row.
         prompts = [req.prompt for req in batch]
         max_new_tokens = [req.max_tokens for req in batch]
-        start = time.perf_counter()
-        # Requests whose reply channel is already closed. Lets the failure
-        # path below know which sinks still need a terminator.
-        closed: set[int] = set()
         try:
             # The hook is ALWAYS passed (not just when a sink is present) so
             # /generate requests get a TTFT stamp too.
@@ -384,82 +479,123 @@ async def worker(runner: ModelRunner) -> None:
                 max_new_tokens=max_new_tokens,
                 on_token=on_token,
             )
-            # Model time for the batch as a whole. Every member of the batch
-            # gets the same number here — it is the cost of the shared pass,
-            # not a per-request measurement. The per-request end-to-end number
-            # is computed by the producer from its own timestamps.
-            model_latency_ms = (time.perf_counter() - start) * 1000.0
             # Count-in == count-out tripwire: a mismatch means the runner
             # dropped or duplicated a sequence, and zip() would silently
             # truncate rather than tell us.
             assert len(results) == len(batch)
-
             for req, (text, tokens_generated) in zip(batch, results):
-                response = GenerateResponse(text=text,tokens_generated=tokens_generated,latency_ms=model_latency_ms)
-                req.t_completion = time.monotonic()
-                assert req.t_arrival is not None
-
-                # Bookkeeping BEFORE announcement: record the metrics, then
-                # wake the producer. set_result() can schedule the waiting
-                # handler immediately, so anything we still need to do must
-                # already be done.
-                total_latency_ms = (req.t_completion - req.t_arrival) * 1000.0
-                ttft_ms = None
-                tpot_ms = None
-                if req.t_first_token is not None:
-                    ttft_ms = (req.t_first_token - req.t_arrival) * 1000.0
-                    if tokens_generated >= 2:
-                        tpot_ms = (req.t_completion - req.t_first_token) * 1000.0 / (tokens_generated - 1)
-                METRICS_WINDOW.append(CompletedRequest(
-                    total_latency_ms=total_latency_ms,
-                    tokens_generated=tokens_generated,
-                    t_completion=req.t_completion,
-                    ttft_ms=ttft_ms,
-                    tpot_ms=tpot_ms,
-                ))
-
-                # ROUTE THE ENDING by reply channel.
-                #   future -> one value, as before.
-                #   sink   -> its text already went out token by token; all it
-                #             needs now is the None end-of-stream sentinel.
-                # This line runs ON the event loop (we're past the await), so a
-                # direct put_nowait is correct here.
-                #
-                # ORDERING: can None overtake a token? No. Every token put was
-                # scheduled with call_soon_threadsafe BEFORE generate_batch
-                # returned, and to_thread delivers its result to this coroutine
-                # through the same loop's FIFO callback queue — so all token
-                # puts run before this coroutine even resumes.
-                if req.sink is not None:
-                    req.sink.put_nowait(None)
-                else:
-                    assert req.future is not None
-                    req.future.set_result(response)
-                closed.add(id(req))
+                complete_request(req, text, tokens_generated)
         except Exception as e:
             # Batch-level failure policy: ZERO ORPHANS. If the shared call
-            # blows up, every Future in the batch must be completed, or those
-            # clients hang forever on an await that will never resolve. The
-            # done() guard covers a partial failure — some Futures may already
-            # be resolved from the loop above, and set_result twice raises.
-            # ZERO ORPHANS applies to streams too: a sink that never gets a
-            # terminator leaves its client hanging on sink.get() forever. A
-            # stream gets the exception object itself as its last item; the
-            # handler turns it into an SSE error frame. `closed` skips requests
-            # already finished before the failure (partial success).
+            # blows up, every request in the batch must be closed, or those
+            # clients hang forever. fail_request skips any already completed.
             logger.exception("batch of %d failed", len(batch))
             for req in batch:
-                if id(req) in closed:
-                    continue
-                if req.sink is not None:
-                    req.sink.put_nowait(e)
-                elif req.future is not None and not req.future.done():
-                    req.future.set_exception(e)
+                fail_request(req, e)
         finally:
             # One task_done() per get(), success or failure — the queue's
             # internal counter must balance regardless of what happened.
             for _ in batch:
                 REQUEST_QUEUE.task_done()
+
+
+# --------------------------- worker: continuous batching --------------------------- #
+async def continuous_worker(runner: ModelRunner) -> None:
+    """
+    SCHEDULER=continuous (default). Iteration-level scheduling: batch
+    membership is decided before EVERY decode step, not once per batch.
+
+    Each trip around the loop is ONE decode step:
+      1. ADMIT   — pull waiting requests into free slots (up to MAX_BATCH_SIZE).
+                   Idle (nothing running) -> block on the queue; busy -> only
+                   take what's already waiting (get_nowait), never wait for more.
+      2. EVICT   — drop rows whose stream client disconnected.
+      3. PREFILL — newcomers are prefilled and merged (engine.add), off-loop.
+      4. STEP    — one decode step for every running row (engine.step), off-loop.
+      5. RETIRE  — finished rows complete their requests; their slots are free
+                   for the next trip's ADMIT.
+
+    Compared to static_worker:
+      - no batching window: a request joins on the next step (~one step of wait),
+      - a short request never waits for a long one to finish,
+      - disconnected streams stop costing compute right away.
+    Cost: each admission's prefill pauses decode for the running rows (a TPOT
+    blip). Chunked prefill is the standard fix; out of scope here.
+
+    Rows are keyed by the GenRequest object itself, so there is no positional
+    zip to break as rows come and go.
+    """
+    engine = ContinuousBatch(runner)
+    tokenizer = runner.tokenizer
+
+    def on_token(req: GenRequest, token_id: int) -> None:
+        route_token(req, token_id, tokenizer)
+
+    def retire(req: GenRequest) -> None:
+        # One task_done() per get(), however the request ends.
+        REQUEST_QUEUE.task_done()
+
+    while True:
+        # ---- 1. ADMIT ----
+        new: list[GenRequest] = []
+        if len(engine) == 0:
+            # Idle state of the whole server, and where shutdown's
+            # cancellation lands. Never spin on an empty queue.
+            new.append(await REQUEST_QUEUE.get())
+        while len(engine) + len(new) < MAX_BATCH_SIZE:
+            try:
+                new.append(REQUEST_QUEUE.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        now = time.monotonic()
+        for req in new:
+            req.t_batch_entry = now
+
+        # ---- 2. EVICT disconnected clients ----
+        # Before paying for a newcomer's prefill or another step for a row
+        # nobody is reading.
+        live_new = []
+        for req in new:
+            if req.cancelled:
+                req.done = True
+                retire(req)
+            else:
+                live_new.append(req)
+        evicted = engine.evict(lambda r: r.cancelled)
+        for req, _ in evicted:
+            req.done = True
+            retire(req)
+        if evicted:
+            logger.info("evicted %d disconnected stream(s)", len(evicted))
+
+        # Snapshot of everyone in flight, for the failure path: if either call
+        # below raises, all of them must be closed (zero orphans).
+        in_flight = engine.keys + live_new
+        try:
+            finished = []
+            # ---- 3. PREFILL newcomers ----
+            if live_new:
+                finished += await asyncio.to_thread(
+                    engine.add,
+                    [(r, r.prompt, r.max_tokens, r.temperature) for r in live_new],
+                    on_token,
+                )
+            # ---- 4. STEP ----
+            if len(engine):
+                finished += await asyncio.to_thread(engine.step, on_token)
+        except Exception as e:
+            logger.exception("continuous step failed; failing %d requests", len(in_flight))
+            for req in in_flight:
+                if not req.done:
+                    fail_request(req, e)
+                    retire(req)
+            engine.reset()
+            continue
+
+        # ---- 5. RETIRE finished rows ----
+        for req, ids in finished:
+            complete_request(req, tokenizer.decode(ids, skip_special_tokens=True), len(ids))
+            retire(req)
 
 
 # --------------------------- app lifecycle --------------------------- #
@@ -480,8 +616,9 @@ async def lifespan(app: FastAPI):
     # returns IMMEDIATELY with a Task handle — it does not block or run the
     # worker inline here. The handle is stashed on app.state so the shutdown
     # half below can cancel it.
-    app.state.worker_task = asyncio.create_task(worker(app.state.runner))
-    logger.info("Background worker started.")
+    worker_fn = {"static": static_worker, "continuous": continuous_worker}[SCHEDULER]
+    app.state.worker_task = asyncio.create_task(worker_fn(app.state.runner))
+    logger.info("Background worker started (scheduler=%s).", SCHEDULER)
 
     yield  # <-- app serves requests for its whole lifetime here
 
@@ -519,6 +656,7 @@ def health(request: Request) -> dict:
         "status": "ok",
         "model_id": runner.model_id,
         "device": str(runner.device),
+        "scheduler": SCHEDULER,
     }
 
 
@@ -641,20 +779,28 @@ async def generate_stream(req: GenerateRequest, request: Request) -> StreamingRe
         sees a terminated stream.
 
         CLIENT DISCONNECT: Starlette stops iterating and closes this
-        generator. The worker keeps pushing into the orphaned sink until the
-        request's max_tokens (the batch can't drop a row mid-flight — that's
-        what continuous batching fixes), then the sink is garbage collected.
-        Accepted cost: at most max_tokens of wasted row compute.
+        generator; the finally below sets gen_req.cancelled. The continuous
+        worker then evicts the row on its next step. The static worker can't
+        drop a row mid-batch, so there the row runs to max_tokens (route_token
+        stops pushing text for it either way).
         """
-        while True:
-            item = await sink.get()
-            if item is None:
-                break
-            if isinstance(item, Exception):
-                yield f"data: {json.dumps({'error': str(item) or type(item).__name__})}\n\n"
-                break
-            yield f"data: {json.dumps({'text': item})}\n\n"
-        yield "data: [DONE]\n\n"
+        finished = False
+        try:
+            while True:
+                item = await sink.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    yield f"data: {json.dumps({'error': str(item) or type(item).__name__})}\n\n"
+                    break
+                yield f"data: {json.dumps({'text': item})}\n\n"
+            yield "data: [DONE]\n\n"
+            finished = True
+        finally:
+            # Client went away mid-stream (Starlette closed this generator).
+            # Flag it so the continuous worker evicts the row next step.
+            if not finished:
+                gen_req.cancelled = True
 
     return StreamingResponse(
         token_stream(),

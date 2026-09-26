@@ -33,8 +33,13 @@ Once the project is finished, Claude teaches me from `LEARNING_LOG.md`, piece
 by piece. If I ask for hints or pseudocode instead of full code on something,
 do that.
 
-## Before implementing anything non-trivial:
-Ask me for my design first. Tell me the tradeoffs, recommend one, let me decide.
+## Design decisions: Claude decides, then explains
+Claude makes the design decisions itself, choosing what's best for a project
+at this level (single GPU, learning-focused, resume-quality). Don't block on
+asking me. For every non-trivial decision, record in `LEARNING_LOG.md`:
+the decision, the alternatives considered, and why they were rejected. After
+the project is complete, Claude walks me through these decisions until I
+understand them.
 
 ## Always verify
 Run the code before calling it done: `verify_decode.py` for any decode change,
