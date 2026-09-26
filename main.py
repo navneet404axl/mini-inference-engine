@@ -1,24 +1,58 @@
 """
 main.py — FastAPI server for the mini inference engine.
 
-v2 scope: every /generate request is serialized through ONE background worker
-that owns the GPU. The flow is now producer/consumer:
+=============================================================================
+WHAT THIS FILE IS
+=============================================================================
+The HTTP front door + the scheduler. It owns:
+  - the two request shapes (Pydantic in/out models),
+  - the queue that decouples HTTP handlers from the GPU,
+  - the single background worker that batches requests and drives the model,
+  - the latency/throughput metrics window.
 
-    /generate handler (producer)
-        --> builds a GenRequest (prompt + params + its own Future)
-        --> puts it on REQUEST_QUEUE
-        --> awaits the Future
-                                  REQUEST_QUEUE (bounded asyncio.Queue)
-    worker() (single consumer)
-        --> gets the next GenRequest
-        --> runs the model
-        --> resolves that request's Future with the result
+It deliberately owns NO model code. Anything that touches weights lives in
+model_runner.py; this file only decides WHEN and WITH WHOM a request runs.
 
-This is the foundation for dynamic batching next week: once all work funnels
-through the one worker, the worker can start pulling N requests at once instead
-of one. The request-queue/backpressure logic, the worker body, and the producer
-body are YOURS (CLAUDE.md / Core List) — left as stubs below. The asyncio wiring
-(queue object, startup/shutdown, create_task) is plumbing and is fully written.
+=============================================================================
+HOW WE GOT HERE (the shape of this file is the history of the project)
+=============================================================================
+v0 — one request, one thread.
+    /generate was a plain `def` that called the model inline. Simple, correct,
+    and hopeless under load: two concurrent clients meant two threads fighting
+    over one GPU, and nothing bounded how many could pile up.
+
+v1 — streaming (/generate/stream).
+    Proved the decode loop could emit tokens incrementally over SSE. Still
+    talked to the model directly — and it still does today (see the note on
+    that endpoint), because a single Future can't carry a token stream.
+
+v2 — producer/consumer (the big structural change).
+    Every /generate call became a PRODUCER: it packs its prompt + params + a
+    private Future into a GenRequest, drops it on REQUEST_QUEUE, and parks on
+    the Future. One background worker() is the sole CONSUMER and the sole
+    owner of the GPU. Flow:
+
+        /generate (producer)                 worker() (single consumer)
+            build GenRequest  ──┐          ┌──> get GenRequest
+            put on queue        ├─ QUEUE ──┤    run the model
+            await .future    <──┘          └──  future.set_result(...)
+
+    Why bother, when the work is still serialized? Because funnelling every
+    request through ONE place is the precondition for batching: a consumer
+    that already holds the queue can choose to pull N items instead of 1.
+
+v3 (2026-07-02) — dynamic batching.
+    worker() grew a two-phase loop: a GRAB phase that assembles a batch under
+    two limits (MAX_BATCH_SIZE, BATCH_WINDOW_S), then a RUN phase that spends
+    ONE forward pass on the whole batch. This is where the throughput came
+    from — the GPU cost per step is nearly flat in batch size, so 8 requests
+    per pass is close to 8x the work for 1x the time.
+
+v4 — metrics.
+    Timestamps were threaded onto GenRequest as it travels, finished requests
+    are recorded in a fixed-size window, and /metrics reports p50/p95/p99 +
+    tokens/sec + queue depth. Percentiles, not averages, because tail latency
+    is the number that actually describes a serving system.
 """
 
 from __future__ import annotations
@@ -42,6 +76,9 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------- request / response models --------------------------- #
+# The public API contract. Pydantic validates and coerces at the edge, so no
+# handler below ever has to defend against a missing field or a temperature of
+# 1e9 — the bounds (ge/le) are enforced before our code runs.
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., description="The text prompt to continue.")
     max_tokens: int = Field(64, ge=1, le=2048, description="Max NEW tokens to generate.")
@@ -54,123 +91,141 @@ class GenerateResponse(BaseModel):
     latency_ms: float
 
 
-# --------------------------- metrics: completed-request record (RESERVED) --------------------------- #
+# --------------------------- metrics: completed-request record --------------------------- #
 @dataclass(frozen=True)
 class CompletedRequest:
+    """One finished request, reduced to just what the metrics math needs.
+
+    Frozen on purpose: once a request is done its record is history and must
+    never be edited in place. Note this stores END-TO-END latency (arrival ->
+    completion, i.e. queue wait + batch wait + GPU time), not model time —
+    that is what a client actually experiences.
+
+    t_completion is kept so compute_metrics() can derive a throughput window
+    (newest - oldest) without a separate clock.
+    """
+
     total_latency_ms: float
     tokens_generated: int
     t_completion: float
 
 
-# class FakeRunner:
-#     def generate_text(self, prompt, max_tokens, temperature):
-#         time.sleep(0.05)  # pretend GPU work (blocking, like the real thing)
-#         return f"fake reply to: {prompt[:20]}", 12
-
-
-# --------------------------- the queue (plumbing) --------------------------- #
-# Single hand-off point between the async HTTP handlers (producers) and the one
-# background worker (consumer) that owns the GPU.
+# --------------------------- the queue --------------------------- #
+# The single hand-off point between the async HTTP handlers (producers) and the
+# one background worker (consumer) that owns the GPU.
 #
 # Why BOUNDED, and why SMALL: maxsize caps how many requests can sit waiting in
-# memory at once. When the queue is full, `await REQUEST_QUEUE.put(...)` blocks
-# the producer until the worker drains one — i.e. the queue itself becomes the
-# backpressure valve instead of letting an unbounded backlog grow until the box
-# OOMs. 32 is a deliberately small placeholder: big enough to keep the worker fed,
-# small enough that overload is felt quickly. Tune it once you have metrics.
+# memory at once. Without a bound, an overloaded server accepts work forever,
+# the backlog grows, every client's latency grows with it, and eventually the
+# box OOMs — the classic failure where the server "never says no" and so fails
+# for everyone at once. With a bound, the queue itself becomes the backpressure
+# valve. 32 is a deliberately small placeholder: big enough to keep the worker
+# fed, small enough that overload is felt immediately rather than hidden.
 #
-# (Constructing the Queue at import time is fine on Python 3.10+: it binds to the
-# running loop lazily on first use, not here.)
+# (Constructing the Queue at import time is fine on Python 3.10+: it binds to
+# the running loop lazily on first use, not here.)
 REQUEST_QUEUE: "asyncio.Queue[GenRequest]" = asyncio.Queue(maxsize=32)
 
-# sliding window of completed requests; oldest fall off automatically
+# Sliding window of completed requests; maxlen makes old records fall off the
+# left automatically, so memory is O(1) and the numbers describe RECENT
+# behaviour instead of averaging in the cold-start requests from an hour ago.
 METRICS_WINDOW: "deque[CompletedRequest]" = deque(maxlen=1000)
 
-# CHANGED 2026-07-02: was no batching knobs (worker consumed one request at a time);
-# now the two dynamic-batching limits below; reason: worker's GRAB phase needs them.
+# The two dynamic-batching knobs (added 2026-07-02, when the worker stopped
+# consuming one request at a time). They encode the central tradeoff:
+#   MAX_BATCH_SIZE  — throughput ceiling. Bigger batch = more requests served
+#                     per forward pass, but more memory and a longer step.
+#   BATCH_WINDOW_S  — latency ceiling on batch formation. How long a lone early
+#                     request is willing to wait for company. Too big and a
+#                     quiet server adds pure dead time to every request; too
+#                     small and bursts never get to batch at all.
 MAX_BATCH_SIZE = 8  # max requests per forward pass
 BATCH_WINDOW_S = 0.05  # accumulation deadline in seconds; clock starts at first arrival
 
 
-# --------------------------- Core List: request container (STUB) --------------------------- #
+# --------------------------- request container --------------------------- #
 @dataclass
 class GenRequest:
     """
     One in-flight generation request as it travels through the queue.
 
-    The producer (/generate) builds one of these, drops it on REQUEST_QUEUE, then
-    awaits `.future`. The worker pulls it off, runs the model, and fulfils
+    The producer (/generate) builds one of these, drops it on REQUEST_QUEUE,
+    then awaits `.future`. The worker pulls it off, runs the model, and fulfils
     `.future` with the result — that round trip is the whole point of the queue.
 
-    Fields (this is the container's "signature" — no behaviour to implement here):
-      - prompt / max_tokens / temperature: the generation inputs.
-      - future: the asyncio.Future the worker resolves with the GenerateResponse.
+    It doubles as the metrics carrier: rather than a side table keyed by
+    request id, each request simply carries its own timestamps along with it.
     """
 
     prompt: str
     max_tokens: int
     temperature: float
-    # asyncio.Future = a one-shot "the result will arrive later" box. The producer
-    # CREATES it and awaits it; the worker fills it via .set_result(...) (or
-    # .set_exception(...) on failure), which is what wakes the awaiting producer.
-    # It must be created on the running loop, so the producer makes it (see
-    # /generate STEP 1) and passes it in here.
+    # asyncio.Future = a one-shot "the result will arrive later" box. The
+    # producer CREATES it and awaits it; the worker fills it via .set_result()
+    # (or .set_exception() on failure), which is what wakes the awaiting
+    # producer. It must be created on the running loop, so the producer makes
+    # it and passes it in here — one fresh Future per request, so results can
+    # never cross wires between clients.
     future: "asyncio.Future[GenerateResponse]"
 
-    # --- metrics timestamps (all optional, default None; NOBODY sets them here) ---
-    # Each records one monotonic clock reading on this request's journey. They are
-    # left as empty slots; the stamping code is Nony's to write at each stage.
-    t_arrival: float | None = None       # stamped by ENDPOINT (/generate) at birth of GenRequest
-    t_batch_entry: float | None = None   # stamped by WORKER when this request is pulled into a batch
-    t_first_token: float | None = None   # stamped by RUNNER inside the decode loop (Stage 1a2, may defer)
-    t_completion: float | None = None    # stamped by WORKER just before set_result
+    # --- metrics timestamps (monotonic clock; optional so each stage can stamp
+    #     only the one it owns) ---
+    t_arrival: float | None = None       # stamped by /generate the moment the request is born
+    t_batch_entry: float | None = None   # stamped by worker() when this request is pulled into a batch
+    t_first_token: float | None = None   # reserved for TTFT; nothing writes it yet — the batched
+                                         # path has no per-request first-token hook (see model_runner)
+    t_completion: float | None = None    # stamped by worker() just before set_result
+
+    # Reading these tells you WHERE time went, which is the whole reason they
+    # exist as separate fields:
+    #   t_batch_entry - t_arrival     = time spent queued (server is saturated)
+    #   t_completion  - t_batch_entry = batch wait + GPU time (model is slow)
 
 
-# --------------------------- Core List: the worker (STUB) --------------------------- #
+# --------------------------- the worker --------------------------- #
 async def worker(runner: ModelRunner) -> None:
     """
-    The single background consumer. Owns the GPU: it is the ONLY thing that calls
-    the model, so all requests are serialized through here. Runs forever until the
+    The single background consumer. Owns the GPU: it is the ONLY thing that
+    calls the model on the /generate path, so all requests are serialized
+    through here and nothing can race for the device. Runs forever until the
     shutdown hook cancels it.
 
     Input:
-      - runner: the shared ModelRunner (loaded once at startup).
+      - runner: the shared ModelRunner (weights loaded once at startup).
     Returns:
       - never returns normally; exits only via cancellation at an await point.
 
-    # CHANGED 2026-07-02: was one-request-at-a-time (get -> run -> resolve) with an
-    # unreachable raise NotImplementedError after the loop; now a two-phase batching
-    # loop (STEP A grab / STEP B run) and the dead raise is deleted; reason: dynamic
-    # batching — amortize each forward pass over up to MAX_BATCH_SIZE requests.
+    HISTORY
+      v2: one request at a time — get -> run -> resolve.
+      v3 (2026-07-02): split into two phases so a single forward pass could be
+      amortized over up to MAX_BATCH_SIZE requests.
 
-    Shape of each trip around the loop:
-      STEP A — GRAB PHASE (yours): assemble a batch off REQUEST_QUEUE, bounded by
-        MAX_BATCH_SIZE and a BATCH_WINDOW_S deadline that starts at first arrival.
-      STEP B — RUN PHASE (written): execute the batch and resolve each request's
-        Future. Temporarily sequential per request; later one batched forward pass.
+    Each trip around the loop:
+      STEP A — GRAB: assemble a batch off REQUEST_QUEUE, bounded by
+        MAX_BATCH_SIZE and a BATCH_WINDOW_S deadline that starts at the FIRST
+        arrival (the deadline does not reset as more requests arrive — a
+        resetting window could be held open indefinitely by steady traffic).
+      STEP B — RUN: one batched call into the runner, then resolve every
+        Future in the batch.
     """
     while True:
-        # ---------------- STEP A: GRAB PHASE (MY LOGIC — do not implement) ----------------
-        # Assemble `batch: list[GenRequest]`:
-        #   - Block on the empty queue; the FIRST arrival opens the batch and starts
-        #     a FIXED deadline (BATCH_WINDOW_S measured from that first arrival —
-        #     the deadline does NOT reset as more requests come in).
-        #   - Keep grabbing further requests, each wait bounded by the REMAINING
-        #     time until that deadline, until the batch is full (MAX_BATCH_SIZE)
-        #     or the deadline expires.
-        #   - TimeoutError is the go-signal ("window closed, ship what you have"),
-        #     not an error.
-        # Tools for this: asyncio.wait_for(...) + asyncio.TimeoutError for the
-        # bounded waits; time.monotonic() for the fixed deadline / remaining-time math.
-        # Move 1 — blocking first grab
+        # ---------------- STEP A: GRAB PHASE ----------------
+        # Block until there is at least one request. This is the idle state of
+        # the whole server, and the await point where cancellation lands at
+        # shutdown. Nothing below runs on an empty queue — we never spin.
         first_req = await REQUEST_QUEUE.get()
         first_req.t_batch_entry = time.monotonic()
         batch = [first_req]
-        # Move 2 — start fixed clock
+
+        # The window opens NOW, on the first arrival, and is fixed from here.
         deadline = time.monotonic() + BATCH_WINDOW_S
-        # Move 3 — accumulation loop: keep going until batch is full
+
+        # Collect companions until the batch is full or the window closes.
         while len(batch) < MAX_BATCH_SIZE:
-            # Move 4 — bounded wait inside
+            # Each wait is bounded by the time LEFT on the original deadline,
+            # not by a fresh BATCH_WINDOW_S — that is what keeps the total
+            # added latency capped at BATCH_WINDOW_S no matter how many
+            # requests trickle in.
             remaining = deadline - time.monotonic()
 
             if remaining <= 0:
@@ -184,16 +239,39 @@ async def worker(runner: ModelRunner) -> None:
                 req.t_batch_entry = time.monotonic()
                 batch.append(req)
 
-            # Move 5 — timeout means window closed
+            # TimeoutError here is the GO signal, not a failure: "window closed,
+            # ship what we have."
             except asyncio.TimeoutError:
                 break
-            
+
+        # ---------------- STEP B: RUN PHASE ----------------
+        # Two parallel lists, built in batch order, because the runner's batched
+        # API is positional.
+        #
+        # INVARIANT: results[i] corresponds to batch[i] — generate_batch
+        # preserves prompt order (verified: tokenizer + output bins are
+        # positional, nothing sorts). If ANY reordering is ever introduced
+        # (sort-by-length bucketing, continuous batching), this positional zip
+        # breaks SILENTLY and clients get each other's text — add explicit id
+        # plumbing BEFORE any such change.
+        #
+        # KNOWN LIMITATION (also in README): the batched path is greedy. Per-
+        # request temperature is accepted by the API but not applied here.
+        # Deliberate: correctness of batching was verified first; batched
+        # sampling is future work.
         prompts = [req.prompt for req in batch]
         max_new_tokens = [req.max_tokens for req in batch]
         start = time.perf_counter()
         try:
             results = runner.generate_batch(prompts=prompts,max_new_tokens=max_new_tokens)
+            # Model time for the batch as a whole. Every member of the batch
+            # gets the same number here — it is the cost of the shared pass,
+            # not a per-request measurement. The per-request end-to-end number
+            # is computed by the producer from its own timestamps.
             model_latency_ms = (time.perf_counter() - start) * 1000.0
+            # Count-in == count-out tripwire: a mismatch means the runner
+            # dropped or duplicated a sequence, and zip() would silently
+            # truncate rather than tell us.
             assert len(results) == len(batch)
 
             for req, (text, tokens_generated) in zip(batch, results):
@@ -201,48 +279,47 @@ async def worker(runner: ModelRunner) -> None:
                 req.t_completion = time.monotonic()
                 assert req.t_arrival is not None
 
+                # Bookkeeping BEFORE announcement: record the metrics, then
+                # wake the producer. set_result() can schedule the waiting
+                # handler immediately, so anything we still need to do must
+                # already be done.
                 total_latency_ms = (req.t_completion - req.t_arrival) * 1000.0
                 METRICS_WINDOW.append(CompletedRequest(total_latency_ms=total_latency_ms,tokens_generated=tokens_generated,t_completion=req.t_completion,))
                 req.future.set_result(response)
         except Exception as e:
+            # Batch-level failure policy: ZERO ORPHANS. If the shared call
+            # blows up, every Future in the batch must be completed, or those
+            # clients hang forever on an await that will never resolve. The
+            # done() guard covers a partial failure — some Futures may already
+            # be resolved from the loop above, and set_result twice raises.
             for req in batch:
                 if not req.future.done():
                     req.future.set_exception(e)
         finally:
+            # One task_done() per get(), success or failure — the queue's
+            # internal counter must balance regardless of what happened.
             for _ in batch:
                 REQUEST_QUEUE.task_done()
-            # ---------------- STEP B (Stage 4): BATCHED RUN — RESERVED, Nony's hands ----------------
-        # INVARIANT: results[i] corresponds to batch[i] — generate_batch preserves prompt
-        # order (verified: tokenizer + bins are positional, nothing sorts). If ANY
-        # reordering is ever added (sort-by-length, continuous batching), positional
-        # zip breaks SILENTLY — add ID plumbing first.
-        #
-        # RESERVED steps:
-        #   1. Build parallel lists from batch: prompts, caps (req.max_tokens) — same order.
-        #   2. Call the runner's batched path (design decision: which layer(s) to call
-        #      to get BOTH texts and per-request token counts).
-        #   3. assert len(results) == len(batch)  — count-in == count-out tripwire.
-        #   4. Per request, IN ORDER: build GenerateResponse, stamp t_completion,
-        #      build CompletedRequest + append to METRICS_WINDOW, then set_result.
-        #      Bookkeeping before announcement, per request.
-        #   5. Batch-level failure policy: if the batched call raises, EVERY Future in
-        #      the batch must receive set_exception — zero orphans.
-        #   6. task_done() once per request, exactly as before.
-        # KNOWN LIMITATION (README): batched path is greedy — per-request temperature
-        # accepted by API but not applied. Verify-first decision; sampling = future work.
 
 
-# --------------------------- app lifecycle (plumbing) --------------------------- #
+# --------------------------- app lifecycle --------------------------- #
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Startup/shutdown hooks.
+
+    Two things must be process-wide singletons, and this is where they are
+    created: the model (loading weights is seconds-expensive and must never
+    happen per request) and the worker task (a second worker would mean two
+    things driving one GPU, which is the exact problem the queue exists to
+    solve).
+    """
     # --- startup ---
     logger.info("Starting up — loading model ...")
     app.state.runner = ModelRunner()  # load weights once; reused for every request
-    # app.state.runner = FakeRunner()
-    # Launch the single background worker. create_task() SCHEDULES the worker()
-    # coroutine to run concurrently on the event loop and returns IMMEDIATELY with a
-    # Task handle — it does not block or run the worker inline here. We stash the
-    # handle on app.state so the shutdown hook below can cancel it.
+    # create_task() SCHEDULES worker() to run concurrently on the event loop and
+    # returns IMMEDIATELY with a Task handle — it does not block or run the
+    # worker inline here. The handle is stashed on app.state so the shutdown
+    # half below can cancel it.
     app.state.worker_task = asyncio.create_task(worker(app.state.runner))
     logger.info("Background worker started.")
 
@@ -250,14 +327,16 @@ async def lifespan(app: FastAPI):
 
     # --- shutdown ---
     logger.info("Shutting down — stopping worker ...")
-    # cancel() requests cancellation: it arranges for a CancelledError to be raised
-    # inside the worker at its next await point (typically `await REQUEST_QUEUE.get()`).
+    # cancel() only REQUESTS cancellation: it arranges for a CancelledError to
+    # be raised inside the worker at its next await point (in practice the
+    # `await REQUEST_QUEUE.get()` it idles on).
     app.state.worker_task.cancel()
     try:
-        # Await the cancelled task so we actually wait for it to unwind before the
-        # process exits. The CancelledError we just triggered propagates out of this
-        # await — catching and ignoring it is the normal, clean way a cancelled task
-        # is reaped (it is NOT an error here, it's the expected exit signal).
+        # Await the cancelled task so we actually wait for it to unwind before
+        # the process exits. The CancelledError we just triggered propagates
+        # out of this await — catching and ignoring it is the normal, clean way
+        # a cancelled task is reaped. It is NOT an error here; it is the
+        # expected exit signal.
         await app.state.worker_task
     except asyncio.CancelledError:
         pass
@@ -270,6 +349,11 @@ app = FastAPI(title="Mini LLM Inference Engine", version="2.0", lifespan=lifespa
 # --------------------------- routes --------------------------- #
 @app.get("/health")
 def health(request: Request) -> dict:
+    """Liveness + "which model am I actually serving" check.
+
+    Sync `def` and deliberately trivial: it must answer even when the GPU is
+    saturated, so it never touches the queue or the model.
+    """
     runner: ModelRunner = request.app.state.runner
     return {
         "status": "ok",
@@ -278,43 +362,28 @@ def health(request: Request) -> dict:
     }
 
 
-# --------------------------- Core List: producer handler (STUB) --------------------------- #
+# --------------------------- producer handler --------------------------- #
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
     """
-    Producer side of the queue. Now `async def` (not the old sync def): it runs ON
-    the event loop so it can await the queue and the Future. It does NOT touch the
-    model directly anymore — it hands work to the worker and waits for the answer.
+    Producer side of the queue.
 
-    Input:
-      - req: the validated GenerateRequest (prompt, max_tokens, temperature).
-    Output:
-      - the GenerateResponse the worker produced for this request.
+    `async def` (it was a sync `def` in v0): it runs ON the event loop, which
+    is what lets it await the Future without occupying a thread. Hundreds of
+    these can be parked at once for the cost of hundreds of small objects.
+    It does NOT touch the model — it hands work to the worker and waits.
 
-    # STEP 1: create a fresh Future for THIS request (your logic here)
-    #   - future = asyncio.get_running_loop().create_future()
-    #   - a Future is the empty "result will arrive later" box; awaiting it parks
-    #     THIS handler until the worker calls set_result/set_exception on it. Fresh
-    #     one per request so results never cross wires between clients.
+    Input:  the validated GenerateRequest (prompt, max_tokens, temperature).
+    Output: the GenerateResponse the worker produced for THIS request.
 
-    # STEP 2: build the request object (your logic here)
-    #   - wrap the prompt + params + that future in a GenRequest.
-
-    # STEP 3: hand it to the worker by putting it on the queue (your logic here)
-    #   - await REQUEST_QUEUE.put(gen_req)
-    #   - this BLOCKS if the queue is full (the backpressure from maxsize). If you'd
-    #     rather reject instead of wait, use REQUEST_QUEUE.put_nowait(...) inside
-    #     try/except asyncio.QueueFull and raise HTTPException(503). Your call —
-    #     this is the backpressure policy that's yours to design.
-
-    # STEP 4: await the result and return it (your logic here)
-    #   - result = await gen_req.future   <-- suspends here until the worker's
-    #     STEP 4 resolves this exact Future; then control resumes with the value.
-    #   - return result
-    #   - (if you used set_exception in the worker, the await re-raises it here.)
+    Steps: create a private Future -> wrap it with the params in a GenRequest
+    (stamping arrival time) -> enqueue -> await -> patch in true end-to-end
+    latency -> return.
     """
     future = asyncio.get_running_loop().create_future()
-    # METRICS STEP 1: stamp t_arrival = time.monotonic() at birth of GenRequest
+    # t_arrival is stamped here, at the earliest point we control, so queue
+    # wait time is included in the latency we report. Stamping it in the worker
+    # would flatter the numbers by hiding exactly the delay we care about.
     gen_req = GenRequest(
         prompt = req.prompt,
         max_tokens = req.max_tokens,
@@ -324,14 +393,22 @@ async def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
     )
 
     try:
-        REQUEST_QUEUE.put_nowait(gen_req) #no await needed if you were doing .put() the you would have needed await 
+        # BACKPRESSURE POLICY (the decision this endpoint really makes):
+        # put_nowait + reject, rather than `await put()` + wait.
+        # `await REQUEST_QUEUE.put(...)` would block this handler until a slot
+        # frees — the client sees an ever-growing timeout with no signal. Fail
+        # fast with 503 instead: the client learns immediately that the server
+        # is full and can retry or shed load. "No" now beats "maybe" later.
+        REQUEST_QUEUE.put_nowait(gen_req) #no await needed if you were doing .put() the you would have needed await
     except asyncio.QueueFull:
         raise HTTPException(status_code=503, detail="server overloaded, try again later")
+    # Suspends here until the worker resolves THIS Future. If the worker called
+    # set_exception (batch failure), that exception is re-raised at this line
+    # and FastAPI turns it into a 500.
     response = await gen_req.future
-    # METRICS STEP 4: compute latency_ms = (t_completion - t_arrival) * 1000
-    # METRICS STEP 5: add tokens_generated + latency_ms to the response model/dict
-    #   (GenerateResponse already declares both fields — see lines ~52-53 — so the
-    #   plumbing is in place; this is just where you populate them. Your logic.)
+    # The worker filled latency_ms with the shared model time for the batch.
+    # Overwrite it with this request's real end-to-end latency: queue wait +
+    # batch wait + GPU. That is the number the caller experienced.
     assert gen_req.t_completion is not None
     assert gen_req.t_arrival is not None
     response.latency_ms = (gen_req.t_completion - gen_req.t_arrival) * 1000
@@ -339,60 +416,88 @@ async def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
 
 
 @app.post("/generate/stream")
-def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse:
+async def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse:
     """Stream generated text token-by-token as Server-Sent Events (SSE).
 
-    NOTE: streaming still calls the runner directly and does NOT go through the
-    queue/worker yet — a single Future can't carry an incremental stream, that
-    needs a per-request chunk channel. Left as-is for now; revisit once the
-    blocking /generate path is flowing through the worker.
+    v5 rewrite (was v1). The old version called the runner DIRECTLY and bypassed
+    the queue/worker because a one-shot Future can't carry an incremental stream.
+    This version routes through the SAME queue + worker path as /generate, but
+    the request carries a per-request "sink" (an asyncio.Queue) instead of a
+    Future — a Future delivers one value, a stream delivers many.
 
-    Wire format (SSE):
-      data: {"text": "<chunk>"}\n\n      <- one per token
+    THE HAND-OFF (whose code is whose):
+      - decode thread (yours, via run_in_executor): PRODUCES tokens into the sink
+        with loop.call_soon_threadsafe(sink.put_nowait, token), then pushes a
+        single None to mark end-of-stream.
+      - THIS handler: CONSUMES the sink and frames each token onto the wire. It
+        does no model work and no blocking work — hence `async def` (v1 was sync
+        `def` because it drove the GPU inline; this one only awaits a Queue, so
+        it belongs on the event loop where one thread serves many live streams).
+
+    WIRE FORMAT (SSE) — this is the contract test_stream.py parses; the body you
+    fill in below must emit exactly this:
+      data: {"text": "<chunk>"}\n\n      <- one frame per token
       ...
-      data: [DONE]\n\n                    <- terminal sentinel
+      data: [DONE]\n\n                    <- terminal sentinel (sink yielded None)
 
-    Each chunk is JSON-encoded (not raw text) so token text containing newlines
-    or quotes can't corrupt the SSE framing. The client concatenates the "text"
-    fields and stops on the [DONE] sentinel.
-
-    Sync `def` on purpose: stream_tokens() does blocking GPU work, so Starlette
-    iterates the returned sync generator in a threadpool and the event loop stays
-    free.
+    Each chunk is JSON-encoded (not raw text) so a token containing newlines or
+    quotes can't corrupt the SSE framing — a raw newline would end the frame
+    early. `json.dumps` is already imported at the top of this file.
     """
-    runner: ModelRunner = request.app.state.runner
+    # STEP 1 — CREATE THE SINK (your logic here)
+    #   Make a fresh asyncio.Queue on the running loop; this is THIS request's
+    #   private token channel. Grab the running loop too if the worker needs a
+    #   handle for call_soon_threadsafe. (yours — this is the sink creation)
 
-    # Prompt -> input_ids on the model's device (mirrors generate_text's tokenize
-    # step; stream_tokens works in token-id space, just like generate_tokens).
-    input_ids = runner.tokenizer(req.prompt, return_tensors="pt").input_ids.to(
-        runner.device
-    )
+    # STEP 2 — ENQUEUE THROUGH THE WORKER PATH (your logic here)
+    #   Build the in-flight request carrying the sink (instead of a Future),
+    #   stamp t_arrival, and put it on REQUEST_QUEUE using the SAME backpressure
+    #   policy /generate uses: put_nowait, and on asyncio.QueueFull raise
+    #   HTTPException(status_code=503, ...). (yours — the enqueue logic)
 
-    def event_stream():
-        # Re-emit each decoded token chunk as an SSE 'data:' frame.
-        for chunk in runner.stream_tokens(
-            input_ids=input_ids,
-            max_tokens=req.max_tokens,
-            temperature=req.temperature,
-        ):
-            yield f"data: {json.dumps({'text': chunk})}\n\n"
-        # Terminal sentinel so the client knows the stream is complete.
-        yield "data: [DONE]\n\n"
+    async def token_stream():
+        """Async generator drained by StreamingResponse on the event loop.
 
+        Its only job: pull tokens off the sink until the None sentinel, framing
+        each as an SSE 'data:' line, then emit [DONE]. Keep at least one `yield`
+        in here — without a `yield` Python makes this a coroutine, not an async
+        generator, and StreamingResponse needs an async iterator.
+        """
+        # STEP 3 — DRAIN LOOP (your logic here)
+        #   Loop: token = await sink.get(); a None means the producer is done ->
+        #   break; otherwise yield  f"data: {json.dumps({'text': token})}\n\n".
+        #   Consider wrapping this in try/finally so a client that disconnects
+        #   mid-stream still unwinds cleanly (drain/cleanup is yours to decide).
+
+        # STEP 4 — TERMINATE (your logic here)
+        #   After the sentinel, emit the terminal frame:  yield "data: [DONE]\n\n"
+        ...
+
+    # --- StreamingResponse setup is wired for you; only the body above is yours ---
     return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
+        token_stream(),
+        media_type="text/event-stream",   # SSE: the browser/client reads discrete events
         headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable proxy buffering so tokens flush live
+            "Cache-Control": "no-cache",       # never cache a live stream
+            "Connection": "keep-alive",        # hold the socket open for the whole stream
+            "X-Accel-Buffering": "no",         # tell nginx/proxies NOT to buffer -> tokens flush live
         },
     )
 
 
-# --------------------------- Core List: metrics math (STUBS) --------------------------- #
+# --------------------------- metrics math --------------------------- #
 def percentile(sorted_values: list[float], p: float) -> float | None:
-    """RESERVED. Pure math, no globals. Assumes input already sorted ascending.
-    Index convention: min(int(p * N), N - 1). Empty list -> None."""
+    """Nearest-rank percentile. Pure math, no globals, no I/O.
+
+    Input:  values ALREADY sorted ascending (the caller sorts once and calls
+            this three times — sorting inside would be 3x the work), and p as
+            a fraction (0.95, not 95).
+    Output: the value at that rank, or None for an empty list.
+
+    Index convention: min(int(p * N), N - 1). The floor picks the nearest rank
+    below; the min() clamp is what stops p=0.99 on a small window from indexing
+    off the end (0.99 * 100 == 100, but the last valid index is 99).
+    """
     ...
     n = len(sorted_values)
 
@@ -404,18 +509,34 @@ def percentile(sorted_values: list[float], p: float) -> float | None:
     return sorted_values[idx]
 
 def compute_metrics() -> dict:
-    """RESERVED. Walks METRICS_WINDOW once: extract latencies, sort ONCE,
-    call percentile() for p50/p95/p99; sum tokens_generated; span =
-    newest t_completion - oldest t_completion; tokens_per_sec = None if
-    fewer than 2 records; percentiles None if empty; always include
-    sample_count. Returns dict: p50_ms, p95_ms, p99_ms, sample_count,
-    tokens_per_sec."""
+    """Reduce METRICS_WINDOW to the numbers /metrics reports.
+
+    Single pass over the window to collect latencies, total tokens, and the
+    oldest/newest completion times; then ONE sort feeding all three
+    percentiles.
+
+    Why percentiles and not a mean: an average hides the tail, and the tail is
+    the user-visible failure mode — p99 is the request that queued behind a
+    full batch. p50/p95/p99 together show the shape of that distribution.
+
+    Throughput is derived from the window's own span (newest - oldest
+    completion) rather than wall-clock uptime, so an idle period doesn't drag
+    the number down. It needs at least 2 records to have a span at all, hence
+    the None below; the span <= 0 guard covers the case where a whole batch
+    completes inside one clock tick.
+
+    Returns: p50_ms, p95_ms, p99_ms, sample_count, tokens_per_sec.
+    Everything except sample_count can be None when the window is too thin —
+    the caller must treat "not enough data yet" as a real state, not zero.
+    """
     ...
     latencies: list[float] = []
     total_tokens = 0
     oldest_t_completion: float | None = None
     newest_t_completion: float | None = None
 
+    # One walk, three quantities. The deque is in completion order, so the
+    # first record seen is the oldest and the last one assigned is the newest.
     for record in METRICS_WINDOW:
         latencies.append(record.total_latency_ms)
         total_tokens += record.tokens_generated
@@ -427,6 +548,8 @@ def compute_metrics() -> dict:
 
     sample_count = len(latencies)
 
+    # Empty window: report honestly rather than inventing zeros, which would
+    # read as "0ms latency, server is perfect".
     if sample_count == 0:
         return {
             "p50_ms": None,
@@ -465,6 +588,13 @@ def compute_metrics() -> dict:
 
 @app.get("/metrics")
 def metrics() -> dict:
+    """Scrape endpoint.
+
+    queue_depth is added here rather than inside compute_metrics() because it
+    is a LIVE gauge (how backed up are we right now), while everything else is
+    a summary of finished work. Read together they tell you the difference
+    between "slow model" and "too much traffic".
+    """
     out = compute_metrics()
     out["queue_depth"] = REQUEST_QUEUE.qsize()
     return out
